@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
 use tokio::sync::{broadcast, oneshot, watch, Mutex, OnceCell, RwLock};
@@ -366,6 +366,7 @@ where
             secure,
         } = request;
         let envd_access_token = secure.then(|| self.access_tokens.generate(sandbox_id));
+        let create_start = Instant::now();
         info!(timeout = ?timeout, "creating sandbox");
 
         let result = match source {
@@ -422,14 +423,30 @@ where
                     ..Default::default()
                 };
 
-                self.launch_sandbox(LaunchPlan::for_create_from_snapshot(
-                    sandbox_id,
-                    snapshot,
-                    launch_config,
-                    transitional_metadata,
-                    NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
-                ))
-                .await
+                let launch_start = Instant::now();
+                let launched = self
+                    .launch_sandbox(LaunchPlan::for_create_from_snapshot(
+                        sandbox_id,
+                        snapshot,
+                        launch_config,
+                        transitional_metadata,
+                        NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
+                    ))
+                    .await;
+                info!(
+                    operation = "create_from_snapshot",
+                    stage = "launch",
+                    elapsed_ms = launch_start.elapsed().as_millis() as u64,
+                    success = launched.is_ok(),
+                    "sandbox stage elapsed"
+                );
+                info!(
+                    operation = "create_from_snapshot",
+                    elapsed_ms = create_start.elapsed().as_millis() as u64,
+                    success = launched.is_ok(),
+                    "sandbox create elapsed"
+                );
+                launched
             }
             SandboxLaunchSource::Image {
                 image_ref,
@@ -1060,6 +1077,7 @@ where
         fields(sandbox_id = %sandbox_id)
     )]
     async fn pause_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+        let pause_start = Instant::now();
         info!("pausing sandbox");
         match self
             .store
@@ -1148,10 +1166,18 @@ where
         };
 
         // Pause the sandbox and capture the paused state for resuming later.
+        let backend_pause_start = Instant::now();
         let paused_state_result = {
             let mut sandbox = handle.lock().await;
             sandbox.pause(artifact_root.as_deref()).await
         };
+        info!(
+            operation = "pause",
+            stage = "backend_pause",
+            elapsed_ms = backend_pause_start.elapsed().as_millis() as u64,
+            success = paused_state_result.is_ok(),
+            "sandbox stage elapsed"
+        );
 
         // If pausing failed, attempt to put the sandbox back and return an error.
         let paused_state = match paused_state_result {
@@ -1204,15 +1230,23 @@ where
             metadata.paused_state = Some(paused_state.clone());
             metadata
         };
-        if let Err(err) = self
+        let persist_start = Instant::now();
+        let persist_result = self
             .persister
             .persist_paused(
                 &persisted_metadata,
                 artifact_root.as_deref(),
                 paused_state.as_ref(),
             )
-            .await
-        {
+            .await;
+        info!(
+            operation = "pause",
+            stage = "persist_paused",
+            elapsed_ms = persist_start.elapsed().as_millis() as u64,
+            success = persist_result.is_ok(),
+            "sandbox stage elapsed"
+        );
+        if let Err(err) = persist_result {
             warn!(error = ?err, "failed to persist paused sandbox state");
             let resume_result = {
                 let mut sandbox = handle.lock().await;
@@ -1253,15 +1287,27 @@ where
         self.store.update(persisted_metadata).await?;
 
         // Stop the sandbox to free up resources.
+        let stop_start = Instant::now();
         let stop_result = {
             let mut sandbox = handle.lock().await;
             sandbox.stop().await
         };
+        info!(
+            operation = "pause",
+            stage = "stop",
+            elapsed_ms = stop_start.elapsed().as_millis() as u64,
+            success = stop_result.is_ok(),
+            "sandbox stage elapsed"
+        );
         if let Err(err) = stop_result {
             warn!(error = ?err, "failed to stop sandbox after pausing");
         }
         self.publish_sandbox_event(SandboxLifecycleEventType::Pause, sandbox_id, resources);
-        info!("sandbox paused");
+        info!(
+            operation = "pause",
+            elapsed_ms = pause_start.elapsed().as_millis() as u64,
+            "sandbox paused"
+        );
 
         Ok(())
     }
@@ -1297,6 +1343,7 @@ where
     ) -> Result<SandboxMetadata> {
         self.ensure_accepting_lifecycle_operations()?;
 
+        let resume_start = Instant::now();
         info!("resuming sandbox");
         let mut metadata = self
             .store
@@ -1384,6 +1431,7 @@ where
             OrchestratorError::InternalError("missing paused state".to_string())
         })?;
 
+        let launch_start = Instant::now();
         let resumed = self
             .launch_sandbox(LaunchPlan::for_resume(
                 sandbox_id,
@@ -1395,6 +1443,13 @@ where
                     .then(|| self.access_tokens.generate(metadata.id)),
             ))
             .await;
+        info!(
+            operation = "resume",
+            stage = "launch",
+            elapsed_ms = launch_start.elapsed().as_millis() as u64,
+            success = resumed.is_ok(),
+            "sandbox stage elapsed"
+        );
         if let Ok(metadata) = resumed.as_ref() {
             self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
                 .await;
@@ -1404,6 +1459,12 @@ where
                 metadata.resources,
             );
         }
+        info!(
+            operation = "resume",
+            elapsed_ms = resume_start.elapsed().as_millis() as u64,
+            success = resumed.is_ok(),
+            "sandbox resume elapsed"
+        );
         resumed
     }
 
@@ -1430,6 +1491,7 @@ where
     ) -> Result<SnapshotCaptureResult> {
         self.ensure_accepting_lifecycle_operations()?;
 
+        let snapshot_start = Instant::now();
         info!("capturing sandbox snapshot");
         match self
             .store
@@ -1466,10 +1528,18 @@ where
         };
 
         // Call sandbox backend to capture the snapshot.
+        let backend_snapshot_start = Instant::now();
         let captured_snapshot_result = {
             let mut sandbox = handle.lock().await;
             sandbox.snapshot().await
         };
+        info!(
+            operation = "snapshot",
+            stage = "backend_snapshot",
+            elapsed_ms = backend_snapshot_start.elapsed().as_millis() as u64,
+            success = captured_snapshot_result.is_ok(),
+            "sandbox stage elapsed"
+        );
 
         // If snapshot capture failed, attempt to roll back to Running state and return an error.
         let captured_snapshot = match captured_snapshot_result {
@@ -1520,7 +1590,11 @@ where
             }
         };
 
-        info!("snapshot captured");
+        info!(
+            operation = "snapshot",
+            elapsed_ms = snapshot_start.elapsed().as_millis() as u64,
+            "snapshot captured"
+        );
         Ok(SnapshotCaptureResult {
             metadata,
             captured_snapshot,

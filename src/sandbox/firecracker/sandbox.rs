@@ -1,13 +1,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use firecracker_client::models::drive::IoEngine;
 use nix::libc;
 use tempfile::TempDir;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
 
@@ -347,9 +348,16 @@ impl SandboxBackend for FirecrackerSandbox {
                 return Err(snapshot_err);
             }
         };
+        let fc_resume_start = Instant::now();
         FirecrackerSandbox::resume(self)
             .await
             .map_err(SandboxCaptureError::terminal)?;
+        info!(
+            operation = "snapshot",
+            stage = "fc_vm_resume",
+            elapsed_ms = fc_resume_start.elapsed().as_millis() as u64,
+            "sandbox stage elapsed"
+        );
 
         Ok(CapturedSandboxSnapshot::new(
             FirecrackerCapturedSnapshot::new(manifest, live_snapshot_root),
@@ -615,6 +623,11 @@ impl FirecrackerSandbox {
     /// This should be called after `start_nowait()` if you want to interact with the sandbox.
     #[tracing::instrument(skip(self))]
     pub(crate) async fn wait_for_ready(&self) -> Result<()> {
+        let envd_ready_start = Instant::now();
+        let operation = match &self.launch {
+            LaunchMode::Fresh(_) => "create",
+            LaunchMode::Resume(_) => "resume",
+        };
         let Some(envd_instance) = self.envd_instance.as_ref() else {
             return Err(anyhow::anyhow!("envd instance not initialized"));
         };
@@ -638,13 +651,21 @@ impl FirecrackerSandbox {
                 .notify_sandbox_ready(device_key)
                 .await;
         }
-        envd_instance
+        let result = envd_instance
             .init(
                 self.launch.common().env_vars.clone(),
                 self.launch.common().default_workdir.clone(),
                 self.launch.common().default_user.clone(),
             )
-            .await
+            .await;
+        info!(
+            operation,
+            stage = "envd_ready",
+            elapsed_ms = envd_ready_start.elapsed().as_millis() as u64,
+            success = result.is_ok(),
+            "sandbox stage elapsed"
+        );
+        result
     }
 
     /// Pause the running sandbox and create a snapshot for later resume.
@@ -688,7 +709,14 @@ impl FirecrackerSandbox {
         snapshot_dir: &Path,
     ) -> Result<(FirecrackerSnapshotConfig, FirecrackerSnapshotManifest)> {
         debug!(snapshot_dir = %snapshot_dir.display(), "pausing sandbox");
+        let fc_pause_start = Instant::now();
         self.fc_instance.pause().await?;
+        info!(
+            operation = "pause",
+            stage = "fc_vm_pause",
+            elapsed_ms = fc_pause_start.elapsed().as_millis() as u64,
+            "sandbox stage elapsed"
+        );
 
         tokio::fs::create_dir_all(snapshot_dir)
             .await
@@ -712,9 +740,16 @@ impl FirecrackerSandbox {
         let memory_output = OverlaybdCompactOutput::from_memory_snapshot_config(
             &ConfigManager::global_config().memory_snapshot,
         );
+        let memory_to_overlaybd_start = Instant::now();
         let (mem_layer_path, mem_virtual_size) = self
             .snapshot_memory_to_overlaybd(&vm_state_path, snapshot_dir, memory_output)
             .await?;
+        info!(
+            operation = "pause",
+            stage = "memory_to_overlaybd",
+            elapsed_ms = memory_to_overlaybd_start.elapsed().as_millis() as u64,
+            "sandbox stage elapsed"
+        );
 
         // Build the memory image config: collect parent layers, make runtime
         // lowers local to this snapshot dir, and compact only if the layer
@@ -752,6 +787,7 @@ impl FirecrackerSandbox {
             runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
         };
 
+        let rootfs_snapshot_start = Instant::now();
         let (base_rootfs_path, rootfs_virtual_size) = if self.uses_overlaybd_ublk() {
             let overlaybd_source = self
                 .launch
@@ -788,10 +824,23 @@ impl FirecrackerSandbox {
                 .context("persist rootfs virtual size for snapshot")?;
             (rootfs_path, size)
         };
+        info!(
+            operation = "pause",
+            stage = "rootfs_snapshot",
+            elapsed_ms = rootfs_snapshot_start.elapsed().as_millis() as u64,
+            "sandbox stage elapsed"
+        );
+        let extra_drives_start = Instant::now();
         let snapshot_extra_drives = self
             .snapshot_extra_drives(snapshot_dir)
             .await
             .context("snapshot extra drives to persistent dir")?;
+        info!(
+            operation = "pause",
+            stage = "extra_drives",
+            elapsed_ms = extra_drives_start.elapsed().as_millis() as u64,
+            "sandbox stage elapsed"
+        );
         let mut snapshot_common = self.launch.common().clone();
         snapshot_common.network_policy = self.current_network_policy.clone();
         snapshot_common.custom_extension_params = self.current_custom_extension_params.clone();
@@ -1396,6 +1445,7 @@ impl FirecrackerSandbox {
 
     #[tracing::instrument(skip(self, config))]
     async fn start_resume(&mut self, config: FirecrackerSnapshotConfig) -> Result<()> {
+        let backend_resume_start = Instant::now();
         // NOTE: The virtio-balloon device is NOT configured here. Balloon state
         // is part of vm_state.bin and is restored automatically by Firecracker.
         // Snapshots taken before balloon support was added will simply not have
@@ -1463,6 +1513,7 @@ impl FirecrackerSandbox {
             let user_image_symlink = fc_cwd.join(USER_ROOTFS_DRIVE_PATH);
             let global_cfg_path = global_config.ublk.overlaybd.global_config_path.clone();
             let runtime_dir = fc_cwd.join("overlaybd");
+            let rootfs_device_start = Instant::now();
             let runtime_device = UblkDeviceManager::global()
                 .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
                     source_image_config: &rootfs_image_config.image_config_path,
@@ -1476,6 +1527,12 @@ impl FirecrackerSandbox {
                 })
                 .await
                 .context("create user image overlaybd runtime device for resume")?;
+            info!(
+                operation = "resume",
+                stage = "rootfs_device",
+                elapsed_ms = rootfs_device_start.elapsed().as_millis() as u64,
+                "sandbox stage elapsed"
+            );
             self.rootfs_image_config_path = Some(rootfs_image_config.image_config_path.clone());
             let device_path = runtime_device.device.device_path().to_path_buf();
             let symlink_result = std::os::unix::fs::symlink(&device_path, &user_image_symlink)
@@ -1522,6 +1579,7 @@ impl FirecrackerSandbox {
             let stdout_path = self.firecracker_stdout_path();
             let stderr_path = self.firecracker_stderr_path();
 
+            let fc_spawn_start = Instant::now();
             self.fc_instance
                 .spawn_with_netns(
                     &firecracker_binary,
@@ -1530,6 +1588,12 @@ impl FirecrackerSandbox {
                     Some(&netns),
                 )
                 .await?;
+            info!(
+                operation = "resume",
+                stage = "fc_spawn",
+                elapsed_ms = fc_spawn_start.elapsed().as_millis() as u64,
+                "sandbox stage elapsed"
+            );
 
             interaction_ip
         };
@@ -1568,6 +1632,7 @@ impl FirecrackerSandbox {
             .memory_snapshot
             .overlaybd_global_config_path
             .clone();
+        let mem_device_start = Instant::now();
         let mem_device = UblkDeviceManager::global()
             .get_or_create_shared_mem(
                 &UblkCreateSpec::Overlaybd {
@@ -1578,6 +1643,12 @@ impl FirecrackerSandbox {
             )
             .await
             .context("create or reuse shared memory ublk device for resume")?;
+        info!(
+            operation = "resume",
+            stage = "mem_device",
+            elapsed_ms = mem_device_start.elapsed().as_millis() as u64,
+            "sandbox stage elapsed"
+        );
         let mem_device_path = mem_device.device_path().to_path_buf();
         self.mem_snapshot_image_config_path =
             Some(config.mem_overlaybd_config.image_config_path.clone());
@@ -1596,6 +1667,7 @@ impl FirecrackerSandbox {
 
         // Override the network interface to use the new tap0 in our namespace
         let network_overrides = [("eth0", "tap0")];
+        let snapshot_load_start = Instant::now();
         self.fc_instance
             .load_snapshot_file(
                 &vm_state_src,
@@ -1623,7 +1695,20 @@ impl FirecrackerSandbox {
 
         self.fc_instance.resume().await?;
 
+        info!(
+            operation = "resume",
+            stage = "snapshot_load",
+            elapsed_ms = snapshot_load_start.elapsed().as_millis() as u64,
+            "sandbox stage elapsed"
+        );
+
         debug!("sandbox restored from snapshot config");
+        info!(
+            operation = "resume",
+            stage = "backend_resume",
+            elapsed_ms = backend_resume_start.elapsed().as_millis() as u64,
+            "sandbox stage elapsed"
+        );
         Ok(())
     }
 

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use axum_extra::extract::CookieJar;
@@ -1148,6 +1148,7 @@ impl Sandboxes<()> for ApiImpl {
                         );
                     };
 
+                    let publish_start = Instant::now();
                     let publish_result = timer
                         .time(
                             "publish",
@@ -1172,6 +1173,14 @@ impl Sandboxes<()> for ApiImpl {
                             ),
                         )
                         .await;
+                    info!(
+                        %sandbox_id,
+                        operation = "pause",
+                        stage = "publish",
+                        elapsed_ms = publish_start.elapsed().as_millis() as u64,
+                        success = publish_result.is_ok(),
+                        "sandbox stage elapsed"
+                    );
                     match publish_result {
                         Ok(snapshot) => {
                             info!(
@@ -1278,7 +1287,8 @@ impl Sandboxes<()> for ApiImpl {
             }
         };
 
-        let published = match timer
+        let publish_start = Instant::now();
+        let publish_result = timer
             .time(
                 "publish",
                 self.snapshot_manager.publish_captured(
@@ -1299,8 +1309,16 @@ impl Sandboxes<()> for ApiImpl {
                     capture.captured_snapshot,
                 ),
             )
-            .await
-        {
+            .await;
+        info!(
+            %sandbox_id,
+            operation = "snapshot",
+            stage = "publish",
+            elapsed_ms = publish_start.elapsed().as_millis() as u64,
+            success = publish_result.is_ok(),
+            "sandbox stage elapsed"
+        );
+        let published = match publish_result {
             Ok(snapshot) => snapshot,
             Err(err) => {
                 let error =
