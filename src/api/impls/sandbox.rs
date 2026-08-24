@@ -7,17 +7,17 @@ use axum_extra::extract::CookieJar;
 use headers::Host;
 use http::Method;
 
-use tracing::warn;
+use tracing::{info, warn};
 
-use crate::cfg::ConfigManager;
+use crate::cfg::{ConfigManager, SnapshotRepositoryBackendKind};
 use crate::image::ResolvedBlockImage;
 use crate::observability::prometheus::SandboxStageTimer;
 use crate::orchestrator::{
     CreateSandboxRequest, NewTimeout, OrchestratorError, SandboxLaunchSource, SandboxListFilter,
     SandboxMetadata, SandboxState, SandboxTimeoutAction,
 };
-use crate::sandbox::CustomExtensionParams;
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
+use crate::sandbox::{CustomExtensionParams, FirecrackerPausedState};
 use crate::snapshot::{
     CommandContext, SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource,
 };
@@ -1089,23 +1089,129 @@ impl Sandboxes<()> for ApiImpl {
                 sandbox_not_found(path_id),
             ));
         };
+        let publish_pause_snapshot = ConfigManager::global_config().snapshot.repository_backend
+            == SnapshotRepositoryBackendKind::MoonCake
+            && matches!(
+                self.orchestrator.get_sandbox(&sandbox_id).await,
+                Ok(Some(metadata)) if metadata.state == SandboxState::Running
+            );
         let timer = SandboxStageTimer::new("pause");
         match timer
             .time("pause", self.orchestrator.pause_sandbox(sandbox_id))
             .await
         {
-            Ok(_) => Ok(
-                SandboxesSandboxIdPausePostResponse::Status204_TheSandboxWasPausedSuccessfullyAndCanBeResumed,
-            ),
+            Ok(_) => {
+                if publish_pause_snapshot {
+                    let metadata = match self.orchestrator.get_sandbox(&sandbox_id).await {
+                        Ok(Some(metadata)) => metadata,
+                        Ok(None) => {
+                            return Ok(
+                                SandboxesSandboxIdPausePostResponse::Status500_ServerError(
+                                    Self::error(
+                                        500,
+                                        format!(
+                                            "sandbox {sandbox_id} was paused, but its metadata disappeared before publishing the Mooncake snapshot"
+                                        ),
+                                    ),
+                                ),
+                            );
+                        }
+                        Err(err) => {
+                            return Ok(
+                                SandboxesSandboxIdPausePostResponse::Status500_ServerError(
+                                    Self::error(
+                                        500,
+                                        format!(
+                                            "sandbox {sandbox_id} was paused, but its metadata could not be loaded for Mooncake publication: {err:#}"
+                                        ),
+                                    ),
+                                ),
+                            );
+                        }
+                    };
+                    let manifest = metadata
+                        .paused_state
+                        .as_deref()
+                        .and_then(|state| state.downcast_ref::<FirecrackerPausedState>())
+                        .and_then(FirecrackerPausedState::publication_manifest)
+                        .cloned();
+                    let Some(manifest) = manifest else {
+                        return Ok(
+                            SandboxesSandboxIdPausePostResponse::Status500_ServerError(
+                                Self::error(
+                                    500,
+                                    format!(
+                                        "sandbox {sandbox_id} was paused, but no publishable Firecracker manifest was retained"
+                                    ),
+                                ),
+                            ),
+                        );
+                    };
+
+                    let publish_result = timer
+                        .time(
+                            "publish",
+                            self.snapshot_manager.publish(
+                                SnapshotPublishMetadata {
+                                    id: SnapshotId::generate(),
+                                    alias: None,
+                                    source: SnapshotPublishSource::Sandbox {
+                                        source_sandbox_id: sandbox_id.to_string(),
+                                    },
+                                    context: metadata.context.clone(),
+                                    startup: metadata.startup.clone(),
+                                    resources: metadata.resources,
+                                    runtime_versions: metadata.runtime_versions.clone(),
+                                    virtualization_mode: metadata.virtualization_mode,
+                                    image_configs: metadata.image_configs.clone(),
+                                    custom_extension_params: metadata
+                                        .custom_extension_params
+                                        .clone(),
+                                },
+                                manifest,
+                            ),
+                        )
+                        .await;
+                    match publish_result {
+                        Ok(snapshot) => {
+                            info!(
+                                %sandbox_id,
+                                snapshot_id = %snapshot.id,
+                                "published paused sandbox snapshot to Mooncake"
+                            );
+                        }
+                        Err(err) => {
+                            warn!(
+                                %sandbox_id,
+                                error = ?err,
+                                "sandbox paused locally but Mooncake snapshot publication failed"
+                            );
+                            return Ok(
+                                SandboxesSandboxIdPausePostResponse::Status500_ServerError(
+                                    Self::error(
+                                        500,
+                                        format!(
+                                            "sandbox {sandbox_id} was paused locally, but its Mooncake snapshot could not be published: {err}"
+                                        ),
+                                    ),
+                                ),
+                            );
+                        }
+                    }
+                }
+
+                Ok(
+                    SandboxesSandboxIdPausePostResponse::Status204_TheSandboxWasPausedSuccessfullyAndCanBeResumed,
+                )
+            }
             Err(OrchestratorError::SandboxNotFound(id)) => Ok(
-                SandboxesSandboxIdPausePostResponse::Status404_NotFound(
-                    sandbox_not_found(id),
-                ),
+                SandboxesSandboxIdPausePostResponse::Status404_NotFound(sandbox_not_found(id)),
             ),
             Err(OrchestratorError::InvalidSandboxState { state, .. }) => Ok(
-                SandboxesSandboxIdPausePostResponse::Status409_Conflict(
-                    Self::error(409, format!("sandbox cannot be paused from {} state", state)),
-                ),
+                SandboxesSandboxIdPausePostResponse::Status409_Conflict(Self::error(
+                    409,
+                    format!("sandbox cannot be paused from {} state", state),
+                )),
             ),
             Err(err) => Ok(SandboxesSandboxIdPausePostResponse::Status500_ServerError(
                 err.into(),

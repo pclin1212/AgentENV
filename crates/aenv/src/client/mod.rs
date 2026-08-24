@@ -49,6 +49,15 @@ impl Client {
         })
     }
 
+    pub fn with_base_url(&self, url: &str) -> Result<Self> {
+        Self::new_with_timeouts(
+            url,
+            &self.api_key,
+            Duration::from_secs(5),
+            Duration::from_secs(120),
+        )
+    }
+
     pub fn transport(
         &self,
         sandbox_id: &str,

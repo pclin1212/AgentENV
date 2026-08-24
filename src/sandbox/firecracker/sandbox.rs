@@ -207,11 +207,25 @@ pub struct FirecrackerCapturedSnapshot {
 #[derive(Clone, Debug)]
 pub struct FirecrackerPausedState {
     snapshot_config: FirecrackerSnapshotConfig,
+    publication_manifest: Option<FirecrackerSnapshotManifest>,
 }
 
 impl FirecrackerPausedState {
     pub fn new(snapshot_config: FirecrackerSnapshotConfig) -> Self {
-        Self { snapshot_config }
+        Self {
+            snapshot_config,
+            publication_manifest: None,
+        }
+    }
+
+    fn with_publication_manifest(
+        snapshot_config: FirecrackerSnapshotConfig,
+        publication_manifest: FirecrackerSnapshotManifest,
+    ) -> Self {
+        Self {
+            snapshot_config,
+            publication_manifest: Some(publication_manifest),
+        }
     }
 
     pub fn decode(_artifact_root: PathBuf, state: serde_json::Value) -> Result<Self> {
@@ -225,6 +239,10 @@ impl FirecrackerPausedState {
 
     pub fn snapshot_config(&self) -> &FirecrackerSnapshotConfig {
         &self.snapshot_config
+    }
+
+    pub fn publication_manifest(&self) -> Option<&FirecrackerSnapshotManifest> {
+        self.publication_manifest.as_ref()
     }
 }
 
@@ -281,13 +299,11 @@ impl SandboxBackend for FirecrackerSandbox {
         artifact_root: Option<&Path>,
     ) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>> {
         let pause_result = match artifact_root {
-            Some(artifact_root) => FirecrackerSandbox::pause_to_dir(self, artifact_root)
-                .await
-                .map(|(snapshot_config, _)| snapshot_config),
-            None => FirecrackerSandbox::pause(self).await,
+            Some(artifact_root) => FirecrackerSandbox::pause_to_dir(self, artifact_root).await,
+            None => FirecrackerSandbox::pause_with_manifest(self).await,
         };
-        let snapshot_config = match pause_result {
-            Ok(snapshot_config) => snapshot_config,
+        let (snapshot_config, publication_manifest) = match pause_result {
+            Ok(snapshot) => snapshot,
             Err(err) => {
                 let pause_err = SandboxCaptureError::from(err);
                 if pause_err.is_terminal() {
@@ -301,7 +317,10 @@ impl SandboxBackend for FirecrackerSandbox {
                 return Err(pause_err);
             }
         };
-        Ok(Arc::new(FirecrackerPausedState::new(snapshot_config)))
+        Ok(Arc::new(FirecrackerPausedState::with_publication_manifest(
+            snapshot_config,
+            publication_manifest,
+        )))
     }
 
     async fn snapshot(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
@@ -645,14 +664,21 @@ impl FirecrackerSandbox {
     ///   `<system-temp>/aenv/managed-snapshots` when `work_dir` is unset.
     /// - `<sandbox_id>` is the [`SandboxID`](crate::types::SandboxId), used to group snapshots by sandbox and improve readability.
     pub async fn pause(&mut self) -> Result<FirecrackerSnapshotConfig> {
+        let (snapshot, _) = self.pause_with_manifest().await?;
+        Ok(snapshot)
+    }
+
+    async fn pause_with_manifest(
+        &mut self,
+    ) -> Result<(FirecrackerSnapshotConfig, FirecrackerSnapshotManifest)> {
         let snapshot_root = self.live_snapshot_root().await?;
         snapshot_root.prepare().await?;
         let snapshot_dir = snapshot_root.path().join(Uuid::now_v7().to_string());
 
-        let (mut snapshot, _) = self.pause_to_dir(&snapshot_dir).await?;
+        let (mut snapshot, manifest) = self.pause_to_dir(&snapshot_dir).await?;
         snapshot.managed_snapshot_root = Some(snapshot_root);
 
-        Ok(snapshot)
+        Ok((snapshot, manifest))
     }
 
     /// Pause the running sandbox and persist its snapshot artifacts into a caller-managed directory.
