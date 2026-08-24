@@ -26,6 +26,19 @@ Gateway treats these headers as sandbox-routing markers:
 
 If one of them exists, gateway resolves node from scheduler binding and forwards request there.
 
+Control-plane clients may set `x-agentenv-target-node-id` to route a request to one
+specific scheduler node. The gateway resolves the exact node ID and does not fall
+back to another node. For a successful `POST /sandboxes` or `POST /sandboxes-cold`,
+the gateway records the returned sandbox ID against that node, so later requests can
+use the normal sandbox binding. The header is removed before forwarding upstream and
+cannot be combined with sandbox data-plane routing headers or host-based routing.
+
+The `aenv` CLI exposes this as `aenv start --node <node-id> ...` and
+`aenv resume --node <node-id> <sandbox-id>`. These forms require the CLI's configured
+server URL to point to the gateway. The legacy
+`aenv resume <target-node-url> <sandbox-id>` form still connects to a backend URL
+directly and therefore bypasses gateway node resolution and assignment recording.
+
 When `gateway.sandbox_proxy_domains` is configured, gateway also accepts host-based sandbox
 data-plane URLs in the form `{port}-{sandboxID}.{proxy_domain}`. The host-derived
 sandbox ID and port take precedence over conflicting routing headers; the gateway logs

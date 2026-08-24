@@ -31,6 +31,7 @@ const (
 	headerTargetPort           = "x-agentenv-target-port"
 	headerE2BTargetPort        = "e2b-sandbox-port"
 	headerNodeID               = "x-agentenv-node-id"
+	headerTargetNodeID         = "x-agentenv-target-node-id"
 	maxRecordAssignmentTimeout = 5 * time.Second
 )
 
@@ -40,6 +41,7 @@ const (
 	routeSourceHeader   routeSource = "header"
 	routeSourceHost     routeSource = "host"
 	routeSourcePath     routeSource = "path"
+	routeSourceNode     routeSource = "node"
 	routeSourceSchedule routeSource = "schedule"
 	routeSourceGateway  routeSource = "gateway"
 )
@@ -183,8 +185,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, hostRouteErr.Error(), http.StatusBadRequest)
 		return
 	}
+	targetNodeID := strings.TrimSpace(r.Header.Get(headerTargetNodeID))
 
-	if hostRoute == nil && !hasProxyRoutingHeaders(r.Header) {
+	if targetNodeID == "" && hostRoute == nil && !hasProxyRoutingHeaders(r.Header) {
 		if isClusterListRequest(r) {
 			setGatewayRouteSource(w, routeSourceGateway)
 			s.handleClusterList(w, r, routingCtx)
@@ -199,7 +202,6 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
 	sandboxID, hasSandbox := "", false
 	routeSource := routeSourceHeader
 	if hostRoute != nil {
@@ -216,10 +218,25 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if !hasSandbox {
 		routeSource = routeSourceSchedule
 	}
+	if targetNodeID != "" {
+		if hostRoute != nil || hasProxyRoutingHeaders(r.Header) {
+			setGatewayRouteSource(w, routeSource)
+			http.Error(w, "target node routing cannot be combined with sandbox data-plane routing", http.StatusBadRequest)
+			return
+		}
+		routeSource = routeSourceNode
+	}
 	setGatewayRouteSource(w, routeSource)
 	var node *schedulerv1.Node
 
-	if hasSandbox {
+	if targetNodeID != "" {
+		var err error
+		node, err = s.resolveTargetNode(routingCtx, targetNodeID)
+		if err != nil {
+			s.writeSchedulerError(w, err)
+			return
+		}
+	} else if hasSandbox {
 		rpcStart := time.Now()
 		resp, err := s.queryOnlyScheduler.LookupNode(routingCtx, &schedulerv1.LookupNodeRequest{SandboxId: sandboxID})
 		recordGatewaySchedulerRPC("LookupNode", rpcStart, err)
@@ -286,6 +303,46 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	)
 }
 
+// resolveTargetNode resolves an explicit node id without invoking the normal
+// scheduling strategy. GetNode supplies readiness information for reporting
+// nodes. Static nodes that do not send heartbeats remain addressable through
+// ListNodes for deployments that intentionally disable observability reports.
+func (s *Server) resolveTargetNode(ctx context.Context, nodeID string) (*schedulerv1.Node, error) {
+	rpcStart := time.Now()
+	resp, err := s.scheduler.GetNode(ctx, &schedulerv1.GetNodeRequest{NodeId: nodeID})
+	recordGatewaySchedulerRPC("GetNode", rpcStart, err)
+	if err == nil {
+		observed := resp.GetNode()
+		if observed == nil || strings.TrimSpace(observed.GetEndpoint()) == "" {
+			return nil, status.Error(codes.Unavailable, "target node endpoint is empty")
+		}
+		if snapshot := observed.GetSnapshot(); snapshot != nil && snapshot.GetStatus() != schedulerv1.NodeStatus_NODE_STATUS_READY {
+			return nil, status.Errorf(codes.Unavailable, "target node %s is not ready (%s)", nodeID, snapshot.GetStatus().String())
+		}
+		return &schedulerv1.Node{NodeId: observed.GetNodeId(), Endpoint: observed.GetEndpoint()}, nil
+	}
+	if status.Code(err) != codes.NotFound {
+		return nil, err
+	}
+
+	rpcStart = time.Now()
+	listResp, listErr := s.scheduler.ListNodes(ctx, &schedulerv1.ListNodesRequest{})
+	recordGatewaySchedulerRPC("ListNodes", rpcStart, listErr)
+	if listErr != nil {
+		return nil, listErr
+	}
+	for _, node := range listResp.GetNodes() {
+		if node.GetNodeId() != nodeID {
+			continue
+		}
+		if strings.TrimSpace(node.GetEndpoint()) == "" {
+			return nil, status.Error(codes.Unavailable, "target node endpoint is empty")
+		}
+		return node, nil
+	}
+	return nil, status.Errorf(codes.NotFound, "target node %s not found", nodeID)
+}
+
 func (s *Server) writeSchedulerError(w http.ResponseWriter, err error) {
 	st, ok := status.FromError(err)
 	if !ok {
@@ -333,6 +390,7 @@ func (s *Server) proxyRequest(
 			req.Out.URL.RawQuery = upstreamURL.RawQuery
 			req.Out.Host = req.In.Host
 			injectForwardedHeaders(req.Out.Header, req.In)
+			req.Out.Header.Del(headerTargetNodeID)
 			if options.hostRoute != nil {
 				req.Out.Header.Set(headerSandboxID, options.hostRoute.sandboxID)
 				req.Out.Header.Set(headerTargetPort, strconv.Itoa(options.hostRoute.targetPort))
@@ -518,7 +576,7 @@ func shouldRecordAssignment(r *http.Request, routeSource routeSource, hasSandbox
 	if !hasSandbox {
 		return path == "/sandboxes" || path == "/sandboxes-cold"
 	}
-	if routeSource != routeSourcePath {
+	if routeSource != routeSourcePath && routeSource != routeSourceNode {
 		return false
 	}
 

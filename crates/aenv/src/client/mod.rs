@@ -5,15 +5,18 @@ pub mod templates;
 
 use crate::auth::Credentials;
 use crate::grpc::Transport;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use std::time::Duration;
 use ureq::Agent;
+
+pub(crate) const TARGET_NODE_ID_HEADER: &str = "x-agentenv-target-node-id";
 
 #[derive(Clone)]
 pub struct Client {
     agent: Agent,
     base: String,
     api_key: String,
+    target_node_id: Option<String>,
 }
 
 impl Client {
@@ -46,6 +49,7 @@ impl Client {
             agent,
             base,
             api_key: api_key.to_string(),
+            target_node_id: None,
         })
     }
 
@@ -56,6 +60,16 @@ impl Client {
             Duration::from_secs(5),
             Duration::from_secs(120),
         )
+    }
+
+    pub fn with_target_node_id(&self, node_id: &str) -> Result<Self> {
+        let node_id = node_id.trim();
+        if node_id.is_empty() {
+            bail!("target node id cannot be empty");
+        }
+        let mut client = self.clone();
+        client.target_node_id = Some(node_id.to_string());
+        Ok(client)
     }
 
     pub fn transport(
@@ -71,21 +85,34 @@ impl Client {
     }
 
     pub fn get(&self, path: &str) -> ureq::Request {
-        self.agent
+        let request = self
+            .agent
             .get(&self.url(path))
-            .set("X-API-Key", &self.api_key)
+            .set("X-API-Key", &self.api_key);
+        self.with_routing_headers(request)
     }
 
     pub fn post(&self, path: &str) -> ureq::Request {
-        self.agent
+        let request = self
+            .agent
             .post(&self.url(path))
-            .set("X-API-Key", &self.api_key)
+            .set("X-API-Key", &self.api_key);
+        self.with_routing_headers(request)
     }
 
     pub fn delete(&self, path: &str) -> ureq::Request {
-        self.agent
+        let request = self
+            .agent
             .delete(&self.url(path))
-            .set("X-API-Key", &self.api_key)
+            .set("X-API-Key", &self.api_key);
+        self.with_routing_headers(request)
+    }
+
+    fn with_routing_headers(&self, request: ureq::Request) -> ureq::Request {
+        match self.target_node_id.as_deref() {
+            Some(node_id) => request.set(TARGET_NODE_ID_HEADER, node_id),
+            None => request,
+        }
     }
 }
 
@@ -135,7 +162,7 @@ fn parse_api_error(body: &str) -> Option<String> {
 }
 #[cfg(test)]
 mod tests {
-    use super::format_status_error;
+    use super::{format_status_error, Client, TARGET_NODE_ID_HEADER};
 
     #[test]
     fn unauthorized_error_explains_how_to_reauthenticate() {
@@ -143,5 +170,24 @@ mod tests {
             format_status_error(401, "").to_string(),
             "authentication failed (HTTP 401 Unauthorized); run `aenv auth` to update your API key"
         );
+    }
+
+    #[test]
+    fn target_node_client_adds_routing_header() {
+        let client = Client::new("http://gateway.test", "secret")
+            .unwrap()
+            .with_target_node_id(" node-65 ")
+            .unwrap();
+
+        let request = client.get("/snapshots");
+        assert_eq!(request.header(TARGET_NODE_ID_HEADER), Some("node-65"));
+        assert_eq!(request.header("X-API-Key"), Some("secret"));
+    }
+
+    #[test]
+    fn target_node_id_cannot_be_empty() {
+        let client = Client::new("http://gateway.test", "secret").unwrap();
+        let error = client.with_target_node_id("  ").err().unwrap();
+        assert!(error.to_string().contains("cannot be empty"));
     }
 }

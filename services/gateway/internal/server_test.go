@@ -20,6 +20,8 @@ import (
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type stubSchedulerClient struct {
@@ -761,6 +763,7 @@ func TestShouldRecordAssignment(t *testing.T) {
 		{name: "create cold sandbox", method: http.MethodPost, path: "/sandboxes-cold", route: routeSourceSchedule, hasSandbox: false, want: true},
 		{name: "create cold sandbox with trailing slash", method: http.MethodPost, path: "/sandboxes-cold/", route: routeSourceSchedule, hasSandbox: false, want: true},
 		{name: "fork sandbox records child assignment", method: http.MethodPost, path: "/sandboxes/sbx-1/fork", route: routeSourcePath, hasSandbox: true, want: true},
+		{name: "targeted fork records child assignment", method: http.MethodPost, path: "/sandboxes/sbx-1/fork", route: routeSourceNode, hasSandbox: true, want: true},
 		{name: "fork-shaped host route is data plane", method: http.MethodPost, path: "/sandboxes/sbx-1/fork", route: routeSourceHost, hasSandbox: true, want: false},
 		{name: "fork-shaped header route is data plane", method: http.MethodPost, path: "/sandboxes/sbx-1/fork", route: routeSourceHeader, hasSandbox: true, want: false},
 		{name: "list sandboxes", method: http.MethodGet, path: "/sandboxes", route: routeSourceSchedule, hasSandbox: false, want: false},
@@ -780,6 +783,110 @@ func TestShouldRecordAssignment(t *testing.T) {
 				t.Fatalf("expected %v, got %v", tc.want, got)
 			}
 		})
+	}
+}
+
+func TestHandleProxyExplicitTargetNodeCreatesAndRecordsAssignment(t *testing.T) {
+	recorded := make(chan *schedulerv1.RecordAssignmentRequest, 1)
+	upstreamTargetHeader := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamTargetHeader <- r.Header.Get(headerTargetNodeID)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"sandboxID":"sbx-targeted"}`))
+	}))
+	defer upstream.Close()
+
+	server := newTestServer(t, stubSchedulerClient{
+		getNodeFunc: func(_ context.Context, req *schedulerv1.GetNodeRequest, _ ...grpc.CallOption) (*schedulerv1.GetNodeResponse, error) {
+			if req.GetNodeId() != "node-65" {
+				return nil, fmt.Errorf("unexpected target node %q", req.GetNodeId())
+			}
+			return &schedulerv1.GetNodeResponse{Node: &schedulerv1.ObservedNode{
+				NodeId:   "node-65",
+				Endpoint: upstream.URL,
+				Snapshot: &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY},
+			}}, nil
+		},
+		recordAssignmentFunc: func(_ context.Context, req *schedulerv1.RecordAssignmentRequest, _ ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
+			recorded <- req
+			return &schedulerv1.RecordAssignmentResponse{}, nil
+		},
+	}, time.Second, 1024)
+
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
+	defer gatewayServer.Close()
+	req, err := http.NewRequest(http.MethodPost, gatewayServer.URL+"/sandboxes", strings.NewReader(`{"snapshotID":"snap-1"}`))
+	if err != nil {
+		t.Fatalf("build request failed: %v", err)
+	}
+	req.Header.Set(headerTargetNodeID, "node-65")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("targeted request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("response status = %d, want %d", resp.StatusCode, http.StatusCreated)
+	}
+	if got := <-upstreamTargetHeader; got != "" {
+		t.Fatalf("target node header leaked upstream: %q", got)
+	}
+	recordReq := <-recorded
+	if recordReq.GetSandboxId() != "sbx-targeted" || recordReq.GetNode().GetNodeId() != "node-65" {
+		t.Fatalf("unexpected assignment: %+v", recordReq)
+	}
+}
+
+func TestResolveTargetNodeFallsBackToStaticDiscovery(t *testing.T) {
+	server := newTestServer(t, stubSchedulerClient{
+		getNodeFunc: func(_ context.Context, _ *schedulerv1.GetNodeRequest, _ ...grpc.CallOption) (*schedulerv1.GetNodeResponse, error) {
+			return nil, status.Error(codes.NotFound, "observed node not found")
+		},
+		listNodesFunc: func(_ context.Context, _ *schedulerv1.ListNodesRequest, _ ...grpc.CallOption) (*schedulerv1.ListNodesResponse, error) {
+			return &schedulerv1.ListNodesResponse{Nodes: []*schedulerv1.Node{
+				{NodeId: "node-61", Endpoint: "http://192.168.25.61:8000"},
+				{NodeId: "node-65", Endpoint: "http://192.168.25.65:8000"},
+			}}, nil
+		},
+	}, time.Second, 1024)
+
+	node, err := server.resolveTargetNode(context.Background(), "node-65")
+	if err != nil {
+		t.Fatalf("resolve static target node failed: %v", err)
+	}
+	if node.GetNodeId() != "node-65" || node.GetEndpoint() != "http://192.168.25.65:8000" {
+		t.Fatalf("unexpected resolved node: %+v", node)
+	}
+}
+
+func TestResolveTargetNodeRejectsUnreadyObservedNode(t *testing.T) {
+	server := newTestServer(t, stubSchedulerClient{
+		getNodeFunc: func(_ context.Context, _ *schedulerv1.GetNodeRequest, _ ...grpc.CallOption) (*schedulerv1.GetNodeResponse, error) {
+			return &schedulerv1.GetNodeResponse{Node: &schedulerv1.ObservedNode{
+				NodeId:   "node-65",
+				Endpoint: "http://192.168.25.65:8000",
+				Snapshot: &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_UNHEALTHY},
+			}}, nil
+		},
+	}, time.Second, 1024)
+
+	_, err := server.resolveTargetNode(context.Background(), "node-65")
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("resolve error = %v, want Unavailable", err)
+	}
+}
+
+func TestHandleProxyRejectsTargetNodeWithDataPlaneRouting(t *testing.T) {
+	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024)
+	req := httptest.NewRequest(http.MethodGet, "/files", nil)
+	req.Header.Set(headerTargetNodeID, "node-65")
+	req.Header.Set(headerSandboxID, "sbx-1")
+	recorder := httptest.NewRecorder()
+
+	authenticatedTestHandler(server).ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("response status = %d, want %d", recorder.Code, http.StatusBadRequest)
 	}
 }
 
