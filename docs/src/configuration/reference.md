@@ -170,11 +170,16 @@ eviction.
 
 ## `[image.cache.remote_blocks]`
 
-Overlaybd registryfs_v2 remote block cache settings. The directory is always
-`<image.cache.root_dir>/remote-blocks`.
+Overlaybd registryfs_v2 remote block cache settings. By default the rootfs
+cache directory is `<image.cache.root_dir>/remote-blocks`. An explicit
+`cache_dir` moves it independently of the commit/index/config cache. The
+memory, conversion, and resize paths remain isolated and are derived as sibling
+directories on the same filesystem so their eviction lifecycles cannot delete
+one another's entries.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
+| `cache_dir` | string | `<image.cache.root_dir>/remote-blocks` | Optional rootfs registryfs_v2 block-cache directory. `$AENV_HOME` is expanded; relative paths are resolved against the config file directory. With a conventional `.../remote-blocks` value, isolated siblings are `memory-blocks`, `convert-blocks`, and `resize-blocks`; otherwise the configured basename is prefixed to those sibling names. |
 | `max_size_gb` | integer | `100` | Maximum size of the overlaybd remote block cache in GiB. This value is written to generated overlaybd `cacheConfig.cacheSizeGB` |
 
 Resolved image data is cached under:
@@ -529,7 +534,8 @@ OverlayBD configuration for ublk. Legacy `enabled` and `device_type` keys are ig
 The file at the configured default path
 `$AENV_HOME/overlaybd/overlaybd-global.json` is **auto-generated** by the server
 at startup. The generated JSON incorporates several TOML settings —
-`[image.cache].root_dir`, `[image.cache.remote_blocks].max_size_gb`,
+`[image.cache].root_dir`, `[image.cache.remote_blocks].cache_dir`,
+`[image.cache.remote_blocks].max_size_gb`,
 `download_enable`, `[backend.oss]` credentials, and Docker registry credentials
 detected from `~/.docker/config.json` — into a single overlaybd runtime config
 file.

@@ -62,6 +62,10 @@ pub struct ImageCacheConfig {
 
 #[derive(Debug, Config, Clone)]
 pub struct ImageRemoteBlocksCacheConfig {
+    /// Optional override for the rootfs registryfs_v2 block cache. Other
+    /// generated OverlayBD configs derive isolated sibling directories from
+    /// this path so their independent eviction lifecycles cannot interfere.
+    pub cache_dir: Option<PathBuf>,
     #[config(default = 10u32)]
     pub max_size_gb: u32,
 }
@@ -96,6 +100,22 @@ pub struct ResolvedImageCacheConfig {
     pub capacity_bytes: Option<u64>,
 }
 
+impl ResolvedImageCacheConfig {
+    /// Derive an isolated cache directory beside the configured rootfs remote
+    /// block cache while keeping all OverlayBD caches on the same filesystem.
+    pub(crate) fn isolated_cache_dir(&self, name: &str) -> PathBuf {
+        let parent = self
+            .remote_blocks_dir
+            .parent()
+            .unwrap_or(self.root_dir.as_path());
+        match self.remote_blocks_dir.file_name().and_then(|v| v.to_str()) {
+            Some(IMAGE_CACHE_REMOTE_BLOCKS_DIR) => parent.join(name),
+            Some(file_name) if !file_name.is_empty() => parent.join(format!("{file_name}-{name}")),
+            _ => self.root_dir.join(name),
+        }
+    }
+}
+
 /// Resolved background hard-commit GC schedule.
 #[derive(Clone, Debug)]
 pub struct ResolvedImageCacheGcConfig {
@@ -122,6 +142,10 @@ impl ImageConfig {
     pub(crate) fn normalize(config: &mut Self, config_dir: &Path, home_path: &Path) {
         config.resolver.normalize();
         config.cache.gc.normalize();
+        if let Some(cache_dir) = config.cache.remote_blocks.cache_dir.as_mut() {
+            let raw = super::resolve_path(home_path, config_dir, cache_dir);
+            *cache_dir = lexically_normalize_path(&raw);
+        }
         let raw = super::resolve_path(home_path, config_dir, &config.cache.root_dir);
         config.cache.root_dir = lexically_normalize_path(&raw);
     }
@@ -130,11 +154,17 @@ impl ImageConfig {
 impl ImageCacheConfig {
     pub(crate) fn layout(&self) -> ResolvedImageCacheConfig {
         let root_dir = lexically_normalize_path(&self.root_dir);
+        let remote_blocks_dir = self
+            .remote_blocks
+            .cache_dir
+            .as_ref()
+            .map(|path| lexically_normalize_path(path))
+            .unwrap_or_else(|| root_dir.join(IMAGE_CACHE_REMOTE_BLOCKS_DIR));
         let remote_blocks_size_gb = self.remote_blocks.max_size_gb;
         let capacity_bytes = self.capacity_gb.map(|gb| gb.saturating_mul(BYTES_PER_GIB));
         ResolvedImageCacheConfig {
             commit_store: root_dir.join(IMAGE_CACHE_COMMIT_DIR),
-            remote_blocks_dir: root_dir.join(IMAGE_CACHE_REMOTE_BLOCKS_DIR),
+            remote_blocks_dir,
             root_dir,
             remote_blocks_size_gb,
             capacity_bytes,
@@ -230,6 +260,59 @@ impl ImageResolverConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_cache_layout_defaults_remote_blocks_under_root() {
+        let cache = ImageCacheConfig {
+            root_dir: PathBuf::from("/var/lib/aenv/image-cache"),
+            ..Default::default()
+        };
+
+        let layout = cache.layout();
+        assert_eq!(
+            layout.remote_blocks_dir,
+            Path::new("/var/lib/aenv/image-cache/remote-blocks")
+        );
+        assert_eq!(
+            layout.isolated_cache_dir("memory-blocks"),
+            Path::new("/var/lib/aenv/image-cache/memory-blocks")
+        );
+    }
+
+    #[test]
+    fn image_cache_normalizes_explicit_remote_blocks_cache_dir() {
+        let mut config = ImageConfig::default();
+        config.cache.root_dir = "$AENV_HOME/image-cache".into();
+        config.cache.remote_blocks.cache_dir = Some("$AENV_HOME/ssd/remote-blocks".into());
+
+        ImageConfig::normalize(
+            &mut config,
+            Path::new("/etc/agentenv"),
+            Path::new("/data/aenv"),
+        );
+
+        let layout = config.cache.layout();
+        assert_eq!(
+            layout.remote_blocks_dir,
+            Path::new("/data/aenv/ssd/remote-blocks")
+        );
+        assert_eq!(
+            layout.isolated_cache_dir("memory-blocks"),
+            Path::new("/data/aenv/ssd/memory-blocks")
+        );
+    }
+
+    #[test]
+    fn isolated_cache_dirs_prefix_a_custom_cache_basename() {
+        let mut cache = ImageCacheConfig::default();
+        cache.remote_blocks.cache_dir = Some("/mnt/nvme/agentenv-cache".into());
+
+        let layout = cache.layout();
+        assert_eq!(
+            layout.isolated_cache_dir("convert-blocks"),
+            Path::new("/mnt/nvme/agentenv-cache-convert-blocks")
+        );
+    }
 
     #[test]
     fn validate_rejects_invalid_gc_watermarks() {

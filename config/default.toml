@@ -92,6 +92,10 @@ try_referrers_overlaybd_prefixes = []
 capacity_gb = 100
 
 [image.cache.remote_blocks]
+# Optional rootfs registry-backed remote block-cache directory. When set,
+# memory/convert/resize caches use isolated sibling directories on the same
+# filesystem. Relative paths are resolved against the config file directory.
+# cache_dir = "$AENV_HOME/image-cache/remote-blocks"
 # Maximum registry-backed remote block-cache size in GiB.
 max_size_gb = 100
 

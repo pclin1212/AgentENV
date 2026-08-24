@@ -18,7 +18,7 @@ use crate::config::{
 use crate::image::image_file::ImageFile;
 use crate::io::virtual_file::VirtualFile;
 use crate::lsmt::file::CommitArgs;
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
@@ -127,10 +127,46 @@ impl ImageService {
         &self.inner.config_path
     }
 
+    /// Create the file-cache directory and repair missing owner access bits.
+    ///
+    /// The ublk daemon deliberately drops broad DAC-override capability. A
+    /// stale cache directory without owner search/write access would therefore
+    /// surface later as an opaque lower-layer `Permission denied` error.
+    fn ensure_cache_dir_usable(cache_dir: &Path) -> Result<()> {
+        std::fs::create_dir_all(cache_dir)?;
+        let metadata = std::fs::metadata(cache_dir)
+            .with_context(|| format!("stat cache dir '{}'", cache_dir.display()))?;
+        ensure!(
+            metadata.is_dir(),
+            "cache dir '{}' exists but is not a directory",
+            cache_dir.display()
+        );
+        #[cfg(target_family = "unix")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = metadata.permissions().mode();
+            if mode & 0o700 != 0o700 {
+                let repaired = mode | 0o700;
+                tracing::warn!(
+                    cache_dir = %cache_dir.display(),
+                    old_mode = format_args!("{mode:o}"),
+                    new_mode = format_args!("{repaired:o}"),
+                    "cache dir lacks owner rwx permissions; repairing"
+                );
+                std::fs::set_permissions(cache_dir, std::fs::Permissions::from_mode(repaired))
+                    .with_context(|| {
+                        format!("repair cache dir '{}' permissions", cache_dir.display())
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
     async fn build_file_cache(cfg: &GlobalConfig) -> Result<Option<FileCacheBackend>> {
         match cfg.cache_config.cache_type.as_str() {
             "" | "file" => {
-                std::fs::create_dir_all(&cfg.cache_config.cache_dir)?;
+                Self::ensure_cache_dir_usable(Path::new(&cfg.cache_config.cache_dir))?;
                 let mut options = FileCacheBackendOptions::from_cache_config(&cfg.cache_config)?;
                 // The cache-owned background download scheduler takes its
                 // node-level caps from the global download config; per-image
@@ -566,6 +602,35 @@ mod tests {
             serde_json::to_vec_pretty(value).expect("serialize json"),
         )
         .expect("write json");
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn ensure_cache_dir_usable_repairs_missing_owner_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let cache_dir = temp.path().join("remote-blocks");
+        std::fs::create_dir(&cache_dir).expect("create cache dir");
+        std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o644))
+            .expect("downgrade cache dir mode");
+
+        ImageService::ensure_cache_dir_usable(&cache_dir).expect("repair cache dir");
+
+        let mode = std::fs::metadata(&cache_dir)
+            .expect("stat cache dir")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o700, 0o700);
+    }
+
+    #[test]
+    fn ensure_cache_dir_usable_rejects_non_directory() {
+        let temp = TempDir::new().expect("tempdir");
+        let cache_dir = temp.path().join("remote-blocks");
+        std::fs::write(&cache_dir, b"not a dir").expect("write file");
+
+        assert!(ImageService::ensure_cache_dir_usable(&cache_dir).is_err());
     }
 
     async fn spawn_server(app: Router) -> (String, tokio::task::JoinHandle<()>) {

@@ -336,7 +336,7 @@ pub(crate) fn write_generated_overlaybd_global_configs(
     })?;
 
     let mut memory_cache = image_cache.clone();
-    memory_cache.remote_blocks_dir = image_cache.root_dir.join("memory-blocks");
+    memory_cache.remote_blocks_dir = image_cache.isolated_cache_dir("memory-blocks");
     write_generated_overlaybd_global_config(
         &config.memory_snapshot.overlaybd_global_config_path,
         config,
@@ -361,7 +361,7 @@ pub(crate) fn write_generated_overlaybd_global_configs(
     // both share `remote-blocks`. Background download stays disabled because
     // conversion only ever opens local layers.
     let mut convert_cache = image_cache.clone();
-    convert_cache.remote_blocks_dir = image_cache.root_dir.join("convert-blocks");
+    convert_cache.remote_blocks_dir = image_cache.isolated_cache_dir("convert-blocks");
     let convert_path = config.resolved_overlaybd_convert_global_config_path();
     write_generated_overlaybd_global_config(
         &convert_path,
@@ -377,7 +377,7 @@ pub(crate) fn write_generated_overlaybd_global_configs(
     // tools above: the C++ file cache would otherwise evict live entries from
     // the shared Rust runtime cache. Background download stays disabled.
     let mut resize_cache = image_cache.clone();
-    resize_cache.remote_blocks_dir = image_cache.root_dir.join("resize-blocks");
+    resize_cache.remote_blocks_dir = image_cache.isolated_cache_dir("resize-blocks");
     let resize_path = config.resolved_overlaybd_resize_global_config_path();
     write_generated_overlaybd_global_config(
         &resize_path,
@@ -711,13 +711,9 @@ fn write_generated_overlaybd_global_config(
     }
 
     if app_config.snapshot.repository_backend == SnapshotRepositoryBackendKind::MoonCake {
-        let mc_config = app_config
-            .backend
-            .mooncake
-            .as_ref()
-            .context(
-                "backend.mooncake config is required when snapshot.repository_backend = mooncake",
-            )?;
+        let mc_config = app_config.backend.mooncake.as_ref().context(
+            "backend.mooncake config is required when snapshot.repository_backend = mooncake",
+        )?;
         config["mcConfig"] = overlaybd_runtime_mc_config(mc_config)?;
     }
 
@@ -791,10 +787,7 @@ fn overlaybd_runtime_oss_config(oss: &OssBackendConfig) -> Result<serde_json::Va
 }
 
 fn overlaybd_runtime_mc_config(mc: &MoonCakeBackendConfig) -> Result<serde_json::Value> {
-    let local_hostname = mc
-        .local_hostname
-        .clone()
-        .unwrap_or_else(detect_hostname);
+    let local_hostname = mc.local_hostname.clone().unwrap_or_else(detect_hostname);
 
     Ok(serde_json::json!({
         "enable": true,
@@ -1286,6 +1279,41 @@ mod tests {
             assert_ne!(
                 memory_value["cacheConfig"]["cacheDir"], other["cacheConfig"]["cacheDir"],
                 "memory cacheDir must be distinct from every other cacheDir"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_overlaybd_configs_honor_explicit_remote_blocks_cache_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let rootfs = temp.path().join("overlaybd-global.json");
+        let mem = temp.path().join("mem-overlaybd-global.json");
+        let mut config =
+            app_config_with_overlaybd_global_configs(temp.path(), rootfs.clone(), mem.clone());
+        let cache_parent = temp.path().join("fast-cache");
+        config.image.cache.remote_blocks.cache_dir = Some(cache_parent.join("remote-blocks"));
+
+        write_generated_overlaybd_global_configs(&config, None).expect("write global configs");
+
+        let cases = [
+            (rootfs, cache_parent.join("remote-blocks")),
+            (mem, cache_parent.join("memory-blocks")),
+            (
+                temp.path().join("convert-overlaybd-global.json"),
+                cache_parent.join("convert-blocks"),
+            ),
+            (
+                temp.path().join("resize-overlaybd-global.json"),
+                cache_parent.join("resize-blocks"),
+            ),
+        ];
+        for (config_path, expected_cache_dir) in cases {
+            let value = read_global_config_value(&config_path);
+            assert_eq!(
+                value["cacheConfig"]["cacheDir"].as_str(),
+                expected_cache_dir.to_str(),
+                "unexpected cacheDir in {}",
+                config_path.display()
             );
         }
     }
