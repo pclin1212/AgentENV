@@ -1,0 +1,25 @@
+{
+  "branches": {
+    "coverage": "-",
+    "missed": 0,
+    "total": 0
+  },
+  "functions": {
+    "coverage": "73.89%",
+    "missed": 1371,
+    "total": 5251
+  },
+  "generated_at": "2026-08-24T03:43:46Z",
+  "lines": {
+    "coverage": "78.06%",
+    "missed": 9650,
+    "total": 43983
+  },
+  "package": "workspace",
+  "regions": {
+    "coverage": "77.27%",
+    "missed": 14088,
+    "total": 61968
+  },
+  "run_url": "https://github.com/pclin1212/AgentENV/actions/runs/32685871556"
+}
