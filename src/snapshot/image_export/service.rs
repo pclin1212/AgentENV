@@ -18,6 +18,9 @@ use crate::snapshot::repository::backends::common::acr::{
     build_oci_image_manifest, host_architecture_for_oci, snapshot_oci_config_blob, OciDescriptor,
     SnapshotOciConfigInput, SourceRegistryRepository,
 };
+use crate::snapshot::repository::backends::mooncake::{
+    MoonCakeArtifactLayout, MoonCakeSnapshotRepository, MoonCakeStoreClient,
+};
 use crate::snapshot::repository::backends::{oss, posixfs};
 use crate::snapshot::repository::{RepositoryError, RepositoryResult, SnapshotRepository};
 use crate::snapshot::{CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, SnapshotId};
@@ -36,6 +39,7 @@ pub struct SnapshotImageResult {
 enum ManagedLayerLocator {
     PosixFs { root: PathBuf },
     Oss { client: Arc<oss::OssClient> },
+    MoonCake { client: MoonCakeStoreClient },
 }
 
 fn layer_digest_size(layer: &OverlaybdLayerRef) -> (&str, u64) {
@@ -94,6 +98,18 @@ impl SnapshotImageService {
                         config.snapshot_image_storage(),
                     ));
                     (repository, ManagedLayerLocator::Oss { client })
+                }
+                SnapshotRepositoryBackendKind::MoonCake => {
+                    let mc_config = config.backend.mooncake.as_ref().context(
+                        "backend.mooncake config is required when repository_backend = mooncake",
+                    )?;
+                    let config =
+                    crate::snapshot::repository::backends::mooncake::NormalizedMoonCakeConfig::new(
+                        mc_config,
+                    )?;
+                    let client = MoonCakeStoreClient::new_sync(&config)?;
+                    let repository = Arc::new(MoonCakeSnapshotRepository::new(client.clone()));
+                    (repository, ManagedLayerLocator::MoonCake { client })
                 }
             };
         Ok(Self {
@@ -333,6 +349,13 @@ impl SnapshotImageService {
             }
             ManagedLayerLocator::Oss { client } => {
                 let key = oss::OssSnapshotArtifactLayout::managed_layer_key(&layer.digest);
+                let name = layer.digest.replace([':', '/'], "_");
+                let destination = tempdir.join(format!("{name}.overlaybd.commit"));
+                let download = client.get_to_file(&key, &destination);
+                materialize_downloaded_layer(layer, &destination, download).await
+            }
+            ManagedLayerLocator::MoonCake { client } => {
+                let key = MoonCakeArtifactLayout::managed_layer_key(&layer.digest);
                 let name = layer.digest.replace([':', '/'], "_");
                 let destination = tempdir.join(format!("{name}.overlaybd.commit"));
                 let download = client.get_to_file(&key, &destination);

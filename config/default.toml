@@ -210,6 +210,7 @@ auto_resume_min_sandbox_timeout_secs = 300
 # Durable repository backend:
 # - "posix_fs" stores snapshots on a local or shared filesystem.
 # - "oss" stores snapshots in S3-compatible object storage.
+# - "moon_cake" stores snapshots in Mooncake.
 repository_backend = "posix_fs"
 
 # EXPERIMENTAL: publish snapshot artifacts to P2P and use P2P during OSS
@@ -246,6 +247,15 @@ p2p_enabled = true
 # access_key_secret = "..."
 # security_token = "..."
 # cache_max_size_gb = 10              # 10 GiB node-local artifact cache
+# [backend.mooncake]
+# metadata_server = "http://127.0.0.1:8015/metadata"
+# master_server_addr = "127.0.0.1:50055"
+# local_hostname = "agentenv-node-1"       # auto-detected when omitted
+# global_segment_size = 0                  # do not expose AgentENV memory as a segment
+# protocol = "tcp"                         # tcp, rdma, or ub
+# device_name = ""                         # required only by transports that need a device
+# preferred_segments = ["nvme-target-1"]  # optional allocation affinity
+# max_object_size = 4194304                # split larger artifacts into 4 MiB objects
 
 [ublk]
 # Explicit daemon executable. The default is under $AENV_HOME/ublk.

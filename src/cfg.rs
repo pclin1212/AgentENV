@@ -143,6 +143,7 @@ pub struct AppConfig {
 pub struct BackendConfig {
     pub posix_fs: Option<PosixFsBackendConfig>,
     pub oss: Option<OssBackendConfig>,
+    pub mooncake: Option<MoonCakeBackendConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone, Config)]
@@ -377,6 +378,30 @@ pub struct OssBackendConfig {
     pub cache_max_size_gb: Option<u64>,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct MoonCakeBackendConfig {
+    /// MoonCake master's HTTP metadata endpoint (e.g. "http://127.0.0.1:8080/metadata").
+    /// This is served by the MoonCake master process itself, not an external Redis.
+    pub metadata_server: String,
+    /// MoonCake master gRPC address (e.g. "127.0.0.1:50051").
+    pub master_server_addr: String,
+    /// Local hostname for this node (auto-detected if unset).
+    pub local_hostname: Option<String>,
+    /// Local transfer segment size in bytes (default: 0, so this AgentENV
+    /// process does not advertise a local memory segment).
+    pub global_segment_size: Option<u64>,
+    /// Transfer protocol: "tcp", "rdma", or "ub" (default: "tcp").
+    pub protocol: Option<String>,
+    /// Device name for RDMA/UB transport (e.g. "mlx5_0").
+    pub device_name: Option<String>,
+    /// Preferred segment names for allocation affinity.
+    pub preferred_segments: Option<Vec<String>>,
+    /// Max object size in bytes before automatic chunking.
+    /// Objects larger than this are split into fixed-size chunks. Default 4 MiB.
+    /// Set to 0 to disable chunking (all objects stored directly).
+    pub max_object_size: Option<u32>,
+}
+
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotImageStoragePolicy {
@@ -390,6 +415,7 @@ pub enum SnapshotImageStoragePolicy {
 pub enum SnapshotRepositoryBackendKind {
     PosixFs,
     Oss,
+    MoonCake,
 }
 
 #[derive(Debug, Config, Clone)]

@@ -381,7 +381,7 @@ Snapshot storage/build configuration.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `local_cache_path` | string | `"$AENV_HOME/snapshot-local-cache"` | Manager-owned node-local snapshot artifact/cache root. Relative explicit paths are resolved against the config file directory. |
-| `repository_backend` | string | `"posix_fs"` | Snapshot repository backend. Supported values: `"posix_fs"` and `"oss"` |
+| `repository_backend` | string | `"posix_fs"` | Snapshot repository backend. Supported values: `"posix_fs"`, `"oss"`, and `"moon_cake"` |
 | `p2p_enabled` | boolean | `true` | When enabled, the snapshot manager publishes committed snapshots to the P2P transport and attempts to resolve from it before falling back to the repository backend. |
 
 Environment variable overrides:
@@ -442,6 +442,37 @@ bucket = "agentenv-snapshots"
 region = "auto"
 addressing_style = "virtual"
 ```
+
+## `[backend.mooncake]`
+
+Mooncake-backed snapshot repository configuration. This section is required
+when `snapshot.repository_backend = "moon_cake"`. AgentENV stores snapshot
+catalog records and artifacts in Mooncake and writes `mc://` managed-layer
+locations into OverlayBD image metadata.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `metadata_server` | string | none | Mooncake master's HTTP metadata endpoint, for example `"http://127.0.0.1:8015/metadata"` |
+| `master_server_addr` | string | none | Mooncake master RPC address, for example `"127.0.0.1:50055"` |
+| `local_hostname` | string | detected hostname | Mooncake client identity for this AgentENV node |
+| `global_segment_size` | integer | `0` | Local transfer segment size in bytes. Keep `0` when AgentENV should consume remote NoF storage without advertising its own memory segment |
+| `protocol` | string | `"tcp"` | Transfer protocol: `"tcp"`, `"rdma"`, or `"ub"` |
+| `device_name` | string | empty | RDMA/UB device name when required by the selected protocol |
+| `preferred_segments` | array of strings | empty | Optional Mooncake allocation-affinity segment names |
+| `max_object_size` | integer | `4194304` | Direct-object/chunk threshold in bytes. Larger artifacts are split into objects of this size; `0` disables AgentENV-side chunking |
+
+The Rust FFI mirrors Mooncake's published `mooncake_replicate_config_t` ABI and
+does not add a `nof_replica_num` field. For a NoF-only write policy, set these
+variables in the AgentENV server environment before startup:
+
+```bash
+export MC_STORE_REPLICA_NUM=0
+export MC_STORE_NOF_REPLICA_NUM=1
+```
+
+They are consumed by the Mooncake client library. `MC_NOF_WORKERS` and
+`MC_NOF_INFLIGHT_BYTES_LIMIT` are also AgentENV-process environment variables,
+because the embedded Mooncake client performs the NoF I/O.
 
 Other path override:
 

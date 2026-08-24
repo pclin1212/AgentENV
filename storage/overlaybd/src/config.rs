@@ -239,6 +239,48 @@ impl Default for OssConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]
+pub struct McConfig {
+    pub enable: bool,
+    /// Local hostname (defaults to platform-detected hostname via
+    /// `/proc/sys/kernel/hostname` or `$HOSTNAME`).
+    pub local_hostname: String,
+    /// MoonCake master's HTTP metadata endpoint (e.g. `"http://127.0.0.1:8080/metadata"`).
+    /// Served by the MoonCake master process — not an external Redis.
+    pub metadata_server: String,
+    /// MoonCake master server address (e.g. `"127.0.0.1:50051"`).
+    pub master_server_addr: String,
+    /// Global segment size in bytes (default: 0 — skip local segment mount).
+    pub global_segment_size: u64,
+    /// Transfer protocol: `"tcp"`, `"rdma"`, or `"ub"` (default: `"tcp"`).
+    pub protocol: String,
+    /// Device name for RDMA/UB transport.
+    pub device_name: String,
+    /// Preferred segment names for allocation affinity.
+    pub preferred_segments: Vec<String>,
+    /// Max object size in bytes before chunking. Objects larger than this are
+    /// split into fixed-size chunks stored as `{key}/chunk-NNNNNNNN` with a
+    /// `{key}/meta` descriptor. Default 4 MiB (matches AgentENV side default).
+    pub max_object_size: u32,
+}
+
+impl Default for McConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            local_hostname: String::new(),
+            metadata_server: String::new(),
+            master_server_addr: String::new(),
+            global_segment_size: 0,
+            protocol: "tcp".to_string(),
+            device_name: String::new(),
+            preferred_segments: Vec::new(),
+            max_object_size: 4 * 1024 * 1024, // 4 MiB
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
 pub struct ExporterConfig {
     pub enable: bool,
     pub uri_prefix: String,
@@ -363,6 +405,7 @@ pub struct GlobalConfig {
     pub cache_config: CacheConfig,
     pub gzip_cache_config: GzipCacheConfig,
     pub oss_config: OssConfig,
+    pub mc_config: McConfig,
     pub log_config: LogConfig,
     pub prefetch_config: PrefetchConfig,
     pub cert_config: CertConfig,
@@ -394,6 +437,7 @@ impl Default for GlobalConfig {
             cache_config: CacheConfig::default(),
             gzip_cache_config: GzipCacheConfig::default(),
             oss_config: OssConfig::default(),
+            mc_config: McConfig::default(),
             log_config: LogConfig::default(),
             prefetch_config: PrefetchConfig::default(),
             cert_config: CertConfig::default(),
@@ -659,6 +703,22 @@ pub fn validate_global_config(cfg: &GlobalConfig) -> Result<()> {
         );
     }
 
+    if cfg.mc_config.enable {
+        ensure!(
+            !cfg.mc_config.metadata_server.is_empty(),
+            "mcConfig.metadataServer cannot be empty when mc is enabled"
+        );
+        ensure!(
+            !cfg.mc_config.master_server_addr.is_empty(),
+            "mcConfig.masterServerAddr cannot be empty when mc is enabled"
+        );
+        ensure!(
+            !cfg.mc_config.local_hostname.is_empty(),
+            "mcConfig.localHostname cannot be empty when mc is enabled"
+        );
+    }
+
+    ensure!(cfg.nr_io_rings != 0, "nr_io_rings cannot be zero");
     Ok(())
 }
 

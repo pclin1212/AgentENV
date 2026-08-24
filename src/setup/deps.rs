@@ -11,8 +11,8 @@ use serde::Deserialize;
 use tracing::{debug, info};
 
 use crate::cfg::{
-    AppConfig, OssAddressingStyle, OssBackendConfig, OverlaybdDependencyConfig,
-    ResolvedImageCacheConfig, SnapshotRepositoryBackendKind,
+    AppConfig, MoonCakeBackendConfig, OssAddressingStyle, OssBackendConfig,
+    OverlaybdDependencyConfig, ResolvedImageCacheConfig, SnapshotRepositoryBackendKind,
 };
 use crate::digest::FileDigest;
 use crate::virtualization::VirtualizationMode;
@@ -710,6 +710,17 @@ fn write_generated_overlaybd_global_config(
         config["ossConfig"] = overlaybd_runtime_oss_config(oss_config)?;
     }
 
+    if app_config.snapshot.repository_backend == SnapshotRepositoryBackendKind::MoonCake {
+        let mc_config = app_config
+            .backend
+            .mooncake
+            .as_ref()
+            .context(
+                "backend.mooncake config is required when snapshot.repository_backend = mooncake",
+            )?;
+        config["mcConfig"] = overlaybd_runtime_mc_config(mc_config)?;
+    }
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create config parent dir {}", parent.display()))?;
@@ -777,6 +788,44 @@ fn overlaybd_runtime_oss_config(oss: &OssBackendConfig) -> Result<serde_json::Va
         }
     }
     Ok(config)
+}
+
+fn overlaybd_runtime_mc_config(mc: &MoonCakeBackendConfig) -> Result<serde_json::Value> {
+    let local_hostname = mc
+        .local_hostname
+        .clone()
+        .unwrap_or_else(detect_hostname);
+
+    Ok(serde_json::json!({
+        "enable": true,
+        "localHostname": local_hostname,
+        "metadataServer": mc.metadata_server,
+        "masterServerAddr": mc.master_server_addr,
+        "globalSegmentSize": mc.global_segment_size.unwrap_or(0),
+        "protocol": mc.protocol.clone().unwrap_or_else(|| "tcp".to_string()),
+        "deviceName": mc.device_name.clone().unwrap_or_default(),
+        "preferredSegments": mc.preferred_segments.clone().unwrap_or_default(),
+        "maxObjectSize": mc.max_object_size.unwrap_or(4_194_304),
+    }))
+}
+
+fn detect_hostname() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/proc/sys/kernel/hostname")
+                .ok()
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty())
+        })
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty())
+        })
+        .unwrap_or_else(|| "localhost".to_string())
 }
 
 /// Detect a docker-config-format credential file the overlaybd runtime can

@@ -8,6 +8,7 @@ use crate::backend::cache::{
     BkDownloadSubmitError, CacheFnTransFunc, CachedFile, FileCacheBackend, FileCacheBackendOptions,
 };
 use crate::backend::local::LocalFile;
+use crate::backend::mc::McBackend;
 use crate::backend::oss::OssBackend;
 use crate::backend::registryfs_v2::RegistryFsV2;
 use crate::config::{
@@ -40,6 +41,7 @@ struct ImageServiceInner {
 struct RemoteRuntime {
     underlay_registryfs: RegistryFsV2,
     oss_backend: Option<OssBackend>,
+    mc_backend: Option<McBackend>,
     file_cache: Option<FileCacheBackend>,
 }
 
@@ -175,11 +177,17 @@ impl ImageService {
         } else {
             None
         };
+        let mc_backend = if self.inner.global_config.mc_config.enable {
+            Some(McBackend::new(&self.inner.global_config.mc_config)?)
+        } else {
+            None
+        };
         let file_cache = Self::build_file_cache(&self.inner.global_config).await?;
 
         Ok(RemoteRuntime {
             underlay_registryfs,
             oss_backend,
+            mc_backend,
             file_cache,
         })
     }
@@ -290,11 +298,12 @@ impl ImageService {
     ) -> Result<Arc<dyn VirtualFile>> {
         let remote_runtime = self.remote_runtime().await?;
         let source = self.open_backend_source_with_size(url, source_size).await?;
-        // OSS blobs always go through the file cache (when available) regardless
-        // of RemoteOpenMode. RemoteOpenMode::Direct is only meaningful for the
-        // P2P accelerator path, which acts as its own cache; OSS has no P2P
-        // channel, so we always want the local file cache as a read-ahead layer.
-        if Self::is_oss_url(url) {
+        // OSS and MC blobs always go through the file cache (when available)
+        // regardless of RemoteOpenMode. RemoteOpenMode::Direct is only
+        // meaningful for the P2P accelerator path, which acts as its own
+        // cache; OSS and MC have no P2P channel, so we always want the local
+        // file cache as a read-ahead layer.
+        if Self::is_oss_url(url) || Self::is_mc_url(url) {
             if let Some(cache) = remote_runtime.file_cache.as_ref() {
                 let cache_file = Self::open_cached_blob(cache, url, source, source_size).await?;
                 return Ok(cache_file);
@@ -427,6 +436,13 @@ impl ImageService {
         }
     }
 
+    fn is_mc_url(url: &str) -> bool {
+        match reqwest::Url::parse(url) {
+            Ok(parsed) => parsed.scheme() == "mc",
+            Err(_) => false,
+        }
+    }
+
     async fn open_backend_source_with_size(
         &self,
         url: &str,
@@ -439,6 +455,13 @@ impl ImageService {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("OSS backend not enabled in config"))?;
             return oss.open_with_size_hint(url, source_size);
+        }
+        if Self::is_mc_url(url) {
+            let mc = remote_runtime
+                .mc_backend
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("MC backend not enabled in config"))?;
+            return mc.open_with_size_hint(url, source_size);
         }
 
         match source_size {

@@ -1,4 +1,5 @@
 pub(crate) mod common;
+pub(crate) mod mooncake;
 pub(crate) mod oss;
 pub(crate) mod posixfs;
 
@@ -12,6 +13,7 @@ use crate::image::cache::local_image_services_from_app_config;
 use crate::p2p::P2pTransport;
 use crate::snapshot::artifact_cache::LocalArtifactCache;
 use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
+pub use mooncake::MoonCakeBackend;
 pub use oss::OssBackend;
 pub use posixfs::{PosixFsBackend, PosixFsBackendConfig};
 
@@ -66,6 +68,19 @@ pub fn build_snapshot_backend(
                 shared_cache_root.join("runtime"),
                 overlaybd_layers,
                 p2p_transport,
+            )?
+            .into_parts())
+        }
+        SnapshotRepositoryBackendKind::MoonCake => {
+            let mooncake_config = config.backend.mooncake.as_ref().context(
+                "backend.mooncake config is required when repository_backend = mooncake",
+            )?;
+            let cache = LocalArtifactCache::new(shared_cache_root.clone(), None)?;
+            Ok(MoonCakeBackend::from_parts(
+                mooncake_config,
+                cache,
+                shared_cache_root.join("runtime"),
+                overlaybd_layers,
             )?
             .into_parts())
         }
