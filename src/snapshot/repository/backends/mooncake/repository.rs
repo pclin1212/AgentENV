@@ -5,16 +5,17 @@
 //! of all snapshot IDs. Every create / delete updates this index atomically
 //! (read-modify-write).
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::client::MoonCakeStoreClient;
 use super::layout::MoonCakeArtifactLayout;
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::repository::interfaces::SnapshotRepository;
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
+use crate::snapshot::timing::time_publish_stage;
 use crate::snapshot::{
     CommittedAttachedDrive, CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, SnapshotAlias,
     SnapshotId, SnapshotListFilter, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
@@ -277,7 +278,9 @@ impl SnapshotRepository for MoonCakeSnapshotRepository {
         metadata: SnapshotPublishMetadata,
         manifest: FirecrackerSnapshotManifest,
     ) -> RepositoryResult<SnapshotRecord> {
-        let id = &metadata.id;
+        let snapshot_id = metadata.id.clone();
+        time_publish_stage(&snapshot_id, "mooncake", "total", async {
+            let id = &metadata.id;
 
         // Validate no duplicate drive ids.
         {
@@ -296,47 +299,103 @@ impl SnapshotRepository for MoonCakeSnapshotRepository {
 
         // 1. Upload VM state artifact.
         let vm_state_local_path = manifest.vm_state.path.as_path();
-        let vm_state_bytes = tokio::fs::read(vm_state_local_path).await.map_err(|e| {
-            RepositoryError::backend(
-                format!(
-                    "read vm_state '{}' for snapshot '{id}'",
-                    vm_state_local_path.display()
-                ),
-                e,
-            )
-        })?;
-        let vm_state_key =
-            MoonCakeArtifactLayout::artifact_key(id, SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
-        self.client
-            .put_chunked(vm_state_key, vm_state_bytes)
-            .await
-            .map_err(|e| {
-                RepositoryError::backend(format!("upload vm_state for snapshot '{id}'"), e)
-            })?;
-
-        // 2. Upload Firecracker manifest.
-        let persisted_manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| {
-            RepositoryError::backend("serialize firecracker manifest".to_string(), e)
-        })?;
-        let manifest_key =
-            MoonCakeArtifactLayout::artifact_key(id, SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest);
-        self.client
-            .put(manifest_key, persisted_manifest_bytes)
-            .await
-            .map_err(|e| {
+        let vm_state_bytes = time_publish_stage(&snapshot_id, "mooncake", "vm_state_read", async {
+            tokio::fs::read(vm_state_local_path).await.map_err(|e| {
                 RepositoryError::backend(
-                    format!("write firecracker manifest for snapshot '{id}'"),
+                    format!(
+                        "read vm_state '{}' for snapshot '{id}'",
+                        vm_state_local_path.display()
+                    ),
                     e,
                 )
-            })?;
+            })
+        })
+        .await?;
+        let vm_state_size = vm_state_bytes.len();
+        let vm_state_key =
+            MoonCakeArtifactLayout::artifact_key(id, SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
+        time_publish_stage(
+            &snapshot_id,
+            "mooncake",
+            "vm_state_upload",
+            async {
+                self.client
+                    .put_chunked(vm_state_key, vm_state_bytes)
+                    .await
+                    .map_err(|e| {
+                        RepositoryError::backend(
+                            format!("upload vm_state for snapshot '{id}'"),
+                            e,
+                        )
+                    })
+            },
+        )
+        .await?;
+        info!(
+            snapshot_id = %id,
+            operation = "publish",
+            component = "mooncake",
+            artifact = "vm_state",
+            bytes = vm_state_size as u64,
+            "snapshot publish artifact uploaded"
+        );
+
+        // 2. Upload Firecracker manifest.
+        let persisted_manifest_bytes = time_publish_stage(
+            &snapshot_id,
+            "mooncake",
+            "manifest_serialize",
+            async {
+                serde_json::to_vec_pretty(&manifest).map_err(|e| {
+                    RepositoryError::backend("serialize firecracker manifest".to_string(), e)
+                })
+            },
+        )
+        .await?;
+        let manifest_size = persisted_manifest_bytes.len();
+        let manifest_key =
+            MoonCakeArtifactLayout::artifact_key(id, SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest);
+        time_publish_stage(
+            &snapshot_id,
+            "mooncake",
+            "manifest_upload",
+            async {
+                self.client
+                    .put(manifest_key, persisted_manifest_bytes)
+                    .await
+                    .map_err(|e| {
+                        RepositoryError::backend(
+                            format!("write firecracker manifest for snapshot '{id}'"),
+                            e,
+                        )
+                    })
+            },
+        )
+        .await?;
+        info!(
+            snapshot_id = %id,
+            operation = "publish",
+            component = "mooncake",
+            artifact = "firecracker_manifest",
+            bytes = manifest_size as u64,
+            "snapshot publish artifact uploaded"
+        );
 
         // 3. Import overlaybd layers (rootfs, memory, attached drives).
-        let rootfs_layers = self
-            .import_managed_layers(&manifest.rootfs.image_config_path)
-            .await?;
-        let memory_layer_refs = self
-            .import_managed_layers(&manifest.memory.image_config_path)
-            .await?;
+        let rootfs_layers = time_publish_stage(
+            &snapshot_id,
+            "mooncake",
+            "rootfs_layers",
+            self.import_managed_layers(id, "rootfs", &manifest.rootfs.image_config_path),
+        )
+        .await?;
+        let memory_layer_refs = time_publish_stage(
+            &snapshot_id,
+            "mooncake",
+            "memory_layers",
+            self.import_managed_layers(id, "memory", &manifest.memory.image_config_path),
+        )
+        .await?;
         let memory_layers: Vec<ManagedLayer> = memory_layer_refs
             .into_iter()
             .filter_map(|layer| match layer {
@@ -344,7 +403,13 @@ impl SnapshotRepository for MoonCakeSnapshotRepository {
                 OverlaybdLayerRef::External(_) => None,
             })
             .collect();
-        let attached_drives = self.import_attached_drives(&manifest).await?;
+        let attached_drives = time_publish_stage(
+            &snapshot_id,
+            "mooncake",
+            "attached_drives",
+            self.import_attached_drives(id, &manifest),
+        )
+        .await?;
 
         // 4. Construct committed snapshot.
         let committed = CommittedSnapshot {
@@ -362,7 +427,14 @@ impl SnapshotRepository for MoonCakeSnapshotRepository {
 
         // 5. Bind alias (if present).
         if let Some(ref alias) = metadata.alias {
-            if let Err(e) = self.bind_alias(alias.as_ref(), id).await {
+            let bind_result = time_publish_stage(
+                &snapshot_id,
+                "mooncake",
+                "alias_bind",
+                self.bind_alias(alias.as_ref(), id),
+            )
+            .await;
+            if let Err(e) = bind_result {
                 let pattern = MoonCakeArtifactLayout::artifact_prefix_regex(id);
                 if let Err(rollback_err) = self.client.remove_by_regex(pattern).await {
                     warn!(snapshot_id = %id, error = %rollback_err, "failed to roll back snapshot artifacts after alias bind failure");
@@ -373,7 +445,14 @@ impl SnapshotRepository for MoonCakeSnapshotRepository {
 
         // 6. Write committed record.
         let now = now_unix_ms();
-        let record = if let Some(mut record) = self.read_record(id).await? {
+        let existing_record = time_publish_stage(
+            &snapshot_id,
+            "mooncake",
+            "catalog_read",
+            self.read_record(id),
+        )
+        .await?;
+        let record = if let Some(mut record) = existing_record {
             record.mark_committed(
                 metadata.alias.clone(),
                 metadata.resources,
@@ -407,17 +486,28 @@ impl SnapshotRepository for MoonCakeSnapshotRepository {
             }
         };
 
-        self.write_record(&record).await?;
-        self.update_index(|ids| {
-            let sid = record.id.to_string();
-            if !ids.contains(&sid) {
-                ids.push(sid);
-            }
+        time_publish_stage(
+            &snapshot_id,
+            "mooncake",
+            "catalog_record_write",
+            self.write_record(&record),
+        )
+        .await?;
+        time_publish_stage(&snapshot_id, "mooncake", "catalog_index_update", async {
+            self.update_index(|ids| {
+                let sid = record.id.to_string();
+                if !ids.contains(&sid) {
+                    ids.push(sid);
+                }
+            })
+            .await
         })
         .await?;
 
         debug!(snapshot_id = %id, "published snapshot to mooncake");
         Ok(record)
+        })
+        .await
     }
 
     async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
@@ -573,6 +663,8 @@ impl MoonCakeSnapshotRepository {
     /// [`OverlaybdLayerRef::External`].
     async fn import_managed_layers(
         &self,
+        snapshot_id: &SnapshotId,
+        layer_group: &str,
         image_config_path: &std::path::Path,
     ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
         use overlaybd::config::load_image_config as load_overlaybd_image_config;
@@ -589,7 +681,9 @@ impl MoonCakeSnapshotRepository {
         for (index, layer) in image_config.lowers.into_iter().enumerate() {
             if !layer.file.is_empty() {
                 let layer_path = std::path::Path::new(&layer.file);
-                let managed = self.import_single_layer(layer_path).await?;
+                let managed = self
+                    .import_single_layer(snapshot_id, layer_group, index, layer_path)
+                    .await?;
                 layers.push(OverlaybdLayerRef::Managed(managed));
                 continue;
             }
@@ -613,6 +707,18 @@ impl MoonCakeSnapshotRepository {
                         size: layer.size,
                     },
                 ));
+                info!(
+                    %snapshot_id,
+                    operation = "publish",
+                    component = "mooncake",
+                    stage = "managed_layer",
+                    layer_group,
+                    layer_index = index as u64,
+                    size_bytes = layer.size,
+                    uploaded = false,
+                    external = true,
+                    "snapshot publish layer processed"
+                );
                 continue;
             }
 
@@ -626,8 +732,13 @@ impl MoonCakeSnapshotRepository {
 
     async fn import_single_layer(
         &self,
+        snapshot_id: &SnapshotId,
+        layer_group: &str,
+        layer_index: usize,
         source: &std::path::Path,
     ) -> RepositoryResult<ManagedLayer> {
+        let layer_start = Instant::now();
+        let digest_start = Instant::now();
         let descriptor = crate::digest::FileDigest::describe(source)
             .await
             .map_err(|e| {
@@ -636,27 +747,54 @@ impl MoonCakeSnapshotRepository {
                     e,
                 )
             })?;
+        let digest_ms = digest_start.elapsed().as_millis() as u64;
 
         let key = MoonCakeArtifactLayout::managed_layer_key(&descriptor.sha256);
 
         // Skip upload if the layer already exists (handles both direct and chunked).
-        if !self
-            .client
-            .exists_chunked(key.clone())
-            .await
-            .map_err(|e| RepositoryError::backend("check managed layer existence".to_string(), e))?
-        {
+        let existence_check_start = Instant::now();
+        let exists = self.client.exists_chunked(key.clone()).await.map_err(|e| {
+            RepositoryError::backend("check managed layer existence".to_string(), e)
+        })?;
+        let existence_check_ms = existence_check_start.elapsed().as_millis() as u64;
+        let mut read_ms = 0;
+        let mut upload_ms = 0;
+        if !exists {
+            let read_start = Instant::now();
             let data = tokio::fs::read(source).await.map_err(|e| {
                 RepositoryError::backend(format!("read managed layer '{}'", source.display()), e)
             })?;
+            read_ms = read_start.elapsed().as_millis() as u64;
+            let upload_start = Instant::now();
             self.client.put_chunked(key, data).await.map_err(|e| {
                 RepositoryError::backend(format!("upload managed layer '{}'", source.display()), e)
             })?;
+            upload_ms = upload_start.elapsed().as_millis() as u64;
             debug!(
                 digest = %descriptor.sha256,
                 "uploaded managed layer to mooncake"
             );
         }
+
+        info!(
+            %snapshot_id,
+            operation = "publish",
+            component = "mooncake",
+            stage = "managed_layer",
+            layer_group,
+            layer_index = layer_index as u64,
+            source = %source.display(),
+            digest = %descriptor.sha256,
+            size_bytes = descriptor.size,
+            uploaded = !exists,
+            external = false,
+            digest_ms,
+            existence_check_ms,
+            read_ms,
+            upload_ms,
+            elapsed_ms = layer_start.elapsed().as_millis() as u64,
+            "snapshot publish layer processed"
+        );
 
         Ok(ManagedLayer {
             digest: descriptor.sha256,
@@ -670,12 +808,16 @@ impl MoonCakeSnapshotRepository {
 
     async fn import_attached_drives(
         &self,
+        snapshot_id: &SnapshotId,
         manifest: &FirecrackerSnapshotManifest,
     ) -> RepositoryResult<Vec<CommittedAttachedDrive>> {
         let mut drives = Vec::with_capacity(manifest.attached_drives.len());
 
         for drive in &manifest.attached_drives {
-            let layers = self.import_managed_layers(&drive.image_config_path).await?;
+            let layer_group = format!("attached_drive:{}", drive.drive_id);
+            let layers = self
+                .import_managed_layers(snapshot_id, &layer_group, &drive.image_config_path)
+                .await?;
 
             drives.push(CommittedAttachedDrive::Overlaybd {
                 drive_id: drive.drive_id.clone(),

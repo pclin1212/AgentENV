@@ -6,6 +6,7 @@ pub mod mock;
 mod p2p;
 pub mod repository;
 pub(crate) mod runtime_support;
+pub(crate) mod timing;
 mod types;
 
 pub use manager::SnapshotManager;

@@ -6,6 +6,7 @@ use futures::{stream, StreamExt};
 use tracing::warn;
 
 use super::p2p::SnapshotP2pArtifact;
+use super::timing::time_publish_stage;
 use super::types::SNAPSHOT_ARTIFACT_LAYOUT;
 use crate::p2p::P2pTransport;
 use crate::sandbox::{
@@ -90,12 +91,7 @@ impl SnapshotManager {
         metadata: SnapshotPublishMetadata,
         manifest: FirecrackerSnapshotManifest,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
-        let record = self
-            .repository
-            .publish(metadata.clone(), manifest.clone())
-            .await?;
-        self.publish_p2p_artifacts(&record, &manifest).await;
-        Ok(record)
+        self.publish_manifest(metadata, manifest).await
     }
 
     #[tracing::instrument(skip(self, metadata), fields(snapshot_id = %metadata.id))]
@@ -111,12 +107,31 @@ impl SnapshotManager {
                 feature: "publishing captured snapshots for this sandbox backend".to_string(),
             })?;
 
-        let record = self
-            .repository
-            .publish(metadata.clone(), manifest.clone())
+        self.publish_manifest(metadata, manifest).await
+    }
+
+    async fn publish_manifest(
+        &self,
+        metadata: SnapshotPublishMetadata,
+        manifest: FirecrackerSnapshotManifest,
+    ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
+        let snapshot_id = metadata.id.clone();
+        time_publish_stage(&snapshot_id, "manager", "total", async {
+            let record = time_publish_stage(
+                &snapshot_id,
+                "manager",
+                "repository_publish",
+                self.repository.publish(metadata, manifest.clone()),
+            )
             .await?;
-        self.publish_p2p_artifacts(&record, &manifest).await;
-        Ok(record)
+            time_publish_stage(&snapshot_id, "manager", "p2p_publish", async {
+                self.publish_p2p_artifacts(&record, &manifest).await;
+                Ok::<(), RepositoryError>(())
+            })
+            .await?;
+            Ok(record)
+        })
+        .await
     }
 
     /// Best effort attempt to publish snapshot artifacts to P2P.
