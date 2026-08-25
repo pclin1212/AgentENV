@@ -8,6 +8,7 @@
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use overlaybd::config::{load_image_config as load_overlaybd_image_config, LayerConfig};
 use tracing::{debug, info, warn};
 
 use super::client::MoonCakeStoreClient;
@@ -389,20 +390,13 @@ impl SnapshotRepository for MoonCakeSnapshotRepository {
             self.import_managed_layers(id, "rootfs", &manifest.rootfs.image_config_path),
         )
         .await?;
-        let memory_layer_refs = time_publish_stage(
+        let memory_layers = time_publish_stage(
             &snapshot_id,
             "mooncake",
             "memory_layers",
-            self.import_managed_layers(id, "memory", &manifest.memory.image_config_path),
+            self.import_memory_layers(id, &manifest.memory.image_config_path),
         )
         .await?;
-        let memory_layers: Vec<ManagedLayer> = memory_layer_refs
-            .into_iter()
-            .filter_map(|layer| match layer {
-                OverlaybdLayerRef::Managed(m) => Some(m),
-                OverlaybdLayerRef::External(_) => None,
-            })
-            .collect();
         let attached_drives = time_publish_stage(
             &snapshot_id,
             "mooncake",
@@ -667,8 +661,6 @@ impl MoonCakeSnapshotRepository {
         layer_group: &str,
         image_config_path: &std::path::Path,
     ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
-        use overlaybd::config::load_image_config as load_overlaybd_image_config;
-
         let image_config = load_overlaybd_image_config(image_config_path).map_err(|e| {
             RepositoryError::backend(
                 format!("load image config '{}'", image_config_path.display()),
@@ -733,6 +725,79 @@ impl MoonCakeSnapshotRepository {
             return Err(RepositoryError::Unsupported {
                 feature: format!("overlaybd lower layer {index} without local file or repoBlobUrl"),
             });
+        }
+
+        Ok(layers)
+    }
+
+    /// Import memory lowers without dropping inherited MoonCake-managed layers.
+    ///
+    /// A sandbox restored from MoonCake has remote `mc://` lowers with no
+    /// local `file` path. Those lowers are still managed by this repository
+    /// and must remain in the next incremental snapshot's memory chain.
+    async fn import_memory_layers(
+        &self,
+        snapshot_id: &SnapshotId,
+        image_config_path: &std::path::Path,
+    ) -> RepositoryResult<Vec<ManagedLayer>> {
+        let image_config = load_overlaybd_image_config(image_config_path).map_err(|e| {
+            RepositoryError::backend(
+                format!("load memory image config '{}'", image_config_path.display()),
+                e,
+            )
+        })?;
+
+        let mut layers = Vec::with_capacity(image_config.lowers.len());
+        for (index, layer) in image_config.lowers.into_iter().enumerate() {
+            if !layer.file.is_empty() {
+                let layer_path = std::path::Path::new(&layer.file);
+                let declared_descriptor = (!layer.digest.is_empty() && layer.size > 0)
+                    .then_some((layer.digest.as_str(), layer.size));
+                layers.push(
+                    self.import_single_layer(
+                        snapshot_id,
+                        "memory",
+                        index,
+                        layer_path,
+                        declared_descriptor,
+                    )
+                    .await?,
+                );
+                continue;
+            }
+
+            let repo_blob_url = layer
+                .effective_repo_blob_url(&image_config.repo_blob_url)
+                .to_string();
+            let managed = managed_memory_layer_from_remote_lower(index, layer, &repo_blob_url)?;
+            let key = MoonCakeArtifactLayout::managed_layer_key(&managed.digest);
+            let exists = self.client.exists_chunked(key.clone()).await.map_err(|e| {
+                RepositoryError::backend(format!("check inherited memory layer '{key}'"), e)
+            })?;
+            if !exists {
+                return Err(RepositoryError::ArtifactNotFound {
+                    artifact: format!(
+                        "memory: inherited managed layer {index} '{}' is missing",
+                        managed.digest
+                    ),
+                });
+            }
+
+            info!(
+                %snapshot_id,
+                operation = "publish",
+                component = "mooncake",
+                stage = "managed_layer",
+                layer_group = "memory",
+                layer_index = index as u64,
+                digest = %managed.digest,
+                size_bytes = managed.size,
+                uploaded = false,
+                external = false,
+                remote_reused = true,
+                "snapshot publish layer processed"
+            );
+            layers.push(managed);
         }
 
         Ok(layers)
@@ -843,6 +908,42 @@ impl MoonCakeSnapshotRepository {
     }
 }
 
+fn managed_memory_layer_from_remote_lower(
+    index: usize,
+    layer: LayerConfig,
+    repo_blob_url: &str,
+) -> RepositoryResult<ManagedLayer> {
+    let is_mooncake_managed_layer = repo_blob_url
+        .strip_prefix("mc://")
+        .and_then(|remainder| remainder.split_once('/'))
+        .is_some_and(|(segment, path)| {
+            !segment.is_empty() && path.trim_end_matches('/') == "managed-layers"
+        });
+    if !is_mooncake_managed_layer {
+        return Err(RepositoryError::Unsupported {
+            feature: format!(
+                "memory layer {index} uses non-MoonCake managed repoBlobUrl '{repo_blob_url}'"
+            ),
+        });
+    }
+
+    let digest = if !layer.digest.is_empty() {
+        layer.digest
+    } else if !layer.target_digest.is_empty() {
+        layer.target_digest
+    } else {
+        return Err(RepositoryError::Unsupported {
+            feature: format!("memory layer {index} without digest"),
+        });
+    };
+
+    Ok(ManagedLayer {
+        digest,
+        size: layer.size,
+        uuid: (!layer.uuid.is_empty()).then_some(layer.uuid),
+    })
+}
+
 async fn resolve_managed_layer_descriptor(
     source: &std::path::Path,
     declared_descriptor: Option<(&str, u64)>,
@@ -892,6 +993,53 @@ async fn resolve_managed_layer_descriptor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inherited_mooncake_memory_layer_remains_managed() {
+        let layer = LayerConfig {
+            digest: "sha256:parent".to_string(),
+            size: 76_750_848,
+            uuid: "parent-uuid".to_string(),
+            ..Default::default()
+        };
+
+        let managed =
+            managed_memory_layer_from_remote_lower(0, layer, "mc://default/managed-layers/")
+                .expect("preserve inherited MoonCake layer");
+
+        assert_eq!(managed.digest, "sha256:parent");
+        assert_eq!(managed.size, 76_750_848);
+        assert_eq!(managed.uuid.as_deref(), Some("parent-uuid"));
+    }
+
+    #[test]
+    fn inherited_memory_layer_from_another_repository_is_rejected() {
+        let layer = LayerConfig {
+            digest: "sha256:parent".to_string(),
+            size: 76_750_848,
+            ..Default::default()
+        };
+
+        let error =
+            managed_memory_layer_from_remote_lower(0, layer, "s3://other-bucket/managed-layers")
+                .expect_err("reject foreign memory repository");
+
+        assert!(error
+            .to_string()
+            .contains("uses non-MoonCake managed repoBlobUrl"));
+    }
+
+    #[test]
+    fn inherited_mooncake_memory_layer_without_digest_is_rejected() {
+        let error = managed_memory_layer_from_remote_lower(
+            0,
+            LayerConfig::default(),
+            "mc://default/managed-layers",
+        )
+        .expect_err("reject inherited layer without content identity");
+
+        assert!(error.to_string().contains("memory layer 0 without digest"));
+    }
 
     #[tokio::test]
     async fn managed_layer_descriptor_reuses_declared_digest() {
