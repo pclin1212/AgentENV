@@ -25,6 +25,7 @@ use tracing::{debug, warn};
 use super::process_vm_reader::ProcessVmReader;
 use super::sandbox::managed_snapshot_base;
 use crate::cfg::ConfigManager;
+use crate::digest::FileDigest;
 use crate::sandbox::ublk::UblkDevice;
 use crate::sandbox::ublk::{
     compact_layers, create_commit_args, OverlaybdCompactOutput, UblkDeviceManager,
@@ -65,10 +66,6 @@ fn into_terminal_snapshot_failure(err: anyhow::Error) -> anyhow::Error {
     SandboxCaptureError::terminal(err).into()
 }
 
-fn local_layer_config(path: &Path) -> LayerConfig {
-    local_layer_config_with_descriptor(path, None)
-}
-
 fn local_layer_config_with_descriptor(
     path: &Path,
     descriptor: Option<&overlaybd::LayerDescriptor>,
@@ -81,6 +78,21 @@ fn local_layer_config_with_descriptor(
         size: descriptor.map(|descriptor| descriptor.size).unwrap_or(0),
         ..Default::default()
     }
+}
+
+#[cfg(test)]
+fn local_layer_config(path: &Path) -> LayerConfig {
+    local_layer_config_with_descriptor(path, None)
+}
+
+async fn describe_local_layer(path: &Path) -> Result<overlaybd::LayerDescriptor> {
+    let descriptor = FileDigest::describe(path)
+        .await
+        .with_context(|| format!("compute digest for sealed layer {}", path.display()))?;
+    Ok(overlaybd::LayerDescriptor {
+        digest: descriptor.sha256,
+        size: descriptor.size,
+    })
 }
 
 fn canonicalized_runtime_owned_roots() -> &'static [PathBuf] {
@@ -438,7 +450,14 @@ async fn rewrite_lowers_with_runtime_roots(
         )
         .await?
         {
-            lowers.push(local_layer_config(&compacted_path));
+            // Compacted layers are immutable. Persist their content descriptor
+            // now so every later publish can reuse it instead of hashing the
+            // entire compacted history again.
+            let descriptor = describe_local_layer(&compacted_path).await?;
+            lowers.push(local_layer_config_with_descriptor(
+                &compacted_path,
+                Some(&descriptor),
+            ));
         }
         return Ok(lowers);
     }
@@ -559,12 +578,13 @@ async fn capture_live_overlaybd_snapshot(
 pub(super) async fn build_mem_snapshot_image_config(
     resume_mem_image_config_path: Option<&Path>,
     new_layer_path: &Path,
+    new_layer_descriptor: &overlaybd::LayerDescriptor,
     output_dir: &Path,
     memory_output: OverlaybdCompactOutput,
 ) -> Result<ImageConfig> {
     let inherited_image_config =
         load_existing_image_config(resume_mem_image_config_path, "memory snapshot")?;
-    let new_layer = local_layer_config(new_layer_path);
+    let new_layer = local_layer_config_with_descriptor(new_layer_path, Some(new_layer_descriptor));
     let lowers = rewrite_lowers_with_owned_runtime_suffix(
         inherited_image_config.lowers,
         output_dir,
@@ -639,9 +659,9 @@ async fn publish_memory_overlaybd_layer(
     output_path: &Path,
     mode: OverlaybdCompactOutput,
     concurrency: usize,
-) -> Result<()> {
+) -> Result<overlaybd::LayerDescriptor> {
     let lower_tmp = output_path.with_extension("commit.tmp");
-    let build_result = async {
+    let build_result: Result<()> = async {
         let output_file: Arc<dyn VirtualFile> = Arc::new(
             LocalFile::new(&lower_tmp)
                 .with_context(|| format!("create temp lower failed: {}", lower_tmp.display()))?,
@@ -665,7 +685,8 @@ async fn publish_memory_overlaybd_layer(
     if build_result.is_err() {
         let _ = tokio::fs::remove_file(&lower_tmp).await;
     }
-    build_result
+    build_result?;
+    describe_local_layer(output_path).await
 }
 
 fn checked_i64_to_u64(value: i64, field: &str) -> Result<u64> {
@@ -758,7 +779,7 @@ pub(crate) async fn convert_dirty_memory_to_overlaybd(
     dirty_ranges: &DirtyMemoryRanges,
     output_dir: &Path,
     mode: OverlaybdCompactOutput,
-) -> Result<(PathBuf, u64)> {
+) -> Result<(PathBuf, u64, overlaybd::LayerDescriptor)> {
     tokio::fs::create_dir_all(output_dir)
         .await
         .with_context(|| format!("create mem overlaybd dir: {}", output_dir.display()))?;
@@ -767,7 +788,7 @@ pub(crate) async fn convert_dirty_memory_to_overlaybd(
     let (mappings, memory_size) = dirty_ranges_to_segment_mappings(dirty_ranges)?;
     let source_file: Arc<dyn VirtualFile> = Arc::new(ProcessVmReader::new(firecracker_pid));
     let src_layers = vec![source_file];
-    publish_memory_overlaybd_layer(
+    let descriptor = publish_memory_overlaybd_layer(
         &src_layers,
         &mappings,
         memory_size,
@@ -778,7 +799,7 @@ pub(crate) async fn convert_dirty_memory_to_overlaybd(
     .await
     .context("compact dirty memory ranges as overlaybd layer")?;
 
-    Ok((data_path, memory_size))
+    Ok((data_path, memory_size, descriptor))
 }
 
 #[cfg(test)]
@@ -1069,9 +1090,13 @@ mod tests {
         let new_layer = temp.path().join("mem_overlaybd").join("overlaybd.commit");
         std::fs::create_dir_all(new_layer.parent().unwrap()).expect("create mem layer dir");
         std::fs::write(&new_layer, b"memory delta").expect("write mem layer");
+        let new_layer_descriptor = describe_local_layer(&new_layer)
+            .await
+            .expect("describe mem layer");
         let image_config = build_mem_snapshot_image_config(
             Some(&parent_config_path),
             &new_layer,
+            &new_layer_descriptor,
             temp.path(),
             OverlaybdCompactOutput::Raw,
         )
@@ -1089,8 +1114,8 @@ mod tests {
             .all(|lower| lower.file.is_empty()));
         let latest = image_config.lowers.last().expect("latest mem lower");
         assert_eq!(PathBuf::from(&latest.file), new_layer);
-        assert!(latest.digest.is_empty());
-        assert_eq!(latest.size, 0);
+        assert_eq!(latest.digest, new_layer_descriptor.digest);
+        assert_eq!(latest.size, new_layer_descriptor.size);
         assert!(image_config.download_override.is_none());
     }
 

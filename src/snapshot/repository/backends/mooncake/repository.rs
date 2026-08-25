@@ -681,8 +681,16 @@ impl MoonCakeSnapshotRepository {
         for (index, layer) in image_config.lowers.into_iter().enumerate() {
             if !layer.file.is_empty() {
                 let layer_path = std::path::Path::new(&layer.file);
+                let declared_descriptor = (!layer.digest.is_empty() && layer.size > 0)
+                    .then_some((layer.digest.as_str(), layer.size));
                 let managed = self
-                    .import_single_layer(snapshot_id, layer_group, index, layer_path)
+                    .import_single_layer(
+                        snapshot_id,
+                        layer_group,
+                        index,
+                        layer_path,
+                        declared_descriptor,
+                    )
                     .await?;
                 layers.push(OverlaybdLayerRef::Managed(managed));
                 continue;
@@ -736,17 +744,12 @@ impl MoonCakeSnapshotRepository {
         layer_group: &str,
         layer_index: usize,
         source: &std::path::Path,
+        declared_descriptor: Option<(&str, u64)>,
     ) -> RepositoryResult<ManagedLayer> {
         let layer_start = Instant::now();
         let digest_start = Instant::now();
-        let descriptor = crate::digest::FileDigest::describe(source)
-            .await
-            .map_err(|e| {
-                RepositoryError::backend(
-                    format!("describe managed layer '{}'", source.display()),
-                    e,
-                )
-            })?;
+        let (descriptor, descriptor_reused) =
+            resolve_managed_layer_descriptor(source, declared_descriptor).await?;
         let digest_ms = digest_start.elapsed().as_millis() as u64;
 
         let key = MoonCakeArtifactLayout::managed_layer_key(&descriptor.sha256);
@@ -788,6 +791,7 @@ impl MoonCakeSnapshotRepository {
             size_bytes = descriptor.size,
             uploaded = !exists,
             external = false,
+            descriptor_reused,
             digest_ms,
             existence_check_ms,
             read_ms,
@@ -836,5 +840,108 @@ impl MoonCakeSnapshotRepository {
         }
 
         Ok(drives)
+    }
+}
+
+async fn resolve_managed_layer_descriptor(
+    source: &std::path::Path,
+    declared_descriptor: Option<(&str, u64)>,
+) -> RepositoryResult<(crate::digest::FileDigest, bool)> {
+    let Some((digest, size)) = declared_descriptor else {
+        let descriptor = crate::digest::FileDigest::describe(source)
+            .await
+            .map_err(|e| {
+                RepositoryError::backend(
+                    format!("describe managed layer '{}'", source.display()),
+                    e,
+                )
+            })?;
+        return Ok((descriptor, false));
+    };
+
+    let source_size = tokio::fs::metadata(source)
+        .await
+        .map_err(|e| {
+            RepositoryError::backend(
+                format!("read managed layer metadata '{}'", source.display()),
+                e,
+            )
+        })?
+        .len();
+    if source_size != size {
+        return Err(RepositoryError::Backend {
+            message: format!(
+                "managed layer descriptor size mismatch for '{}': descriptor says {}, file has {}",
+                source.display(),
+                size,
+                source_size
+            ),
+            source: None,
+        });
+    }
+
+    Ok((
+        crate::digest::FileDigest {
+            size,
+            sha256: digest.to_string(),
+        },
+        true,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn managed_layer_descriptor_reuses_declared_digest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layer = temp.path().join("layer.commit");
+        tokio::fs::write(&layer, b"sealed layer")
+            .await
+            .expect("write layer");
+
+        let (descriptor, reused) = resolve_managed_layer_descriptor(
+            &layer,
+            Some(("sha256:declared", b"sealed layer".len() as u64)),
+        )
+        .await
+        .expect("reuse declared descriptor");
+
+        assert!(reused);
+        assert_eq!(descriptor.sha256, "sha256:declared");
+        assert_eq!(descriptor.size, b"sealed layer".len() as u64);
+    }
+
+    #[tokio::test]
+    async fn managed_layer_descriptor_hashes_descriptorless_layer() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layer = temp.path().join("layer.commit");
+        tokio::fs::write(&layer, b"legacy layer")
+            .await
+            .expect("write layer");
+
+        let (descriptor, reused) = resolve_managed_layer_descriptor(&layer, None)
+            .await
+            .expect("hash legacy layer");
+
+        assert!(!reused);
+        assert_eq!(descriptor.size, b"legacy layer".len() as u64);
+        assert_ne!(descriptor.sha256, "sha256:declared");
+    }
+
+    #[tokio::test]
+    async fn managed_layer_descriptor_rejects_size_mismatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layer = temp.path().join("layer.commit");
+        tokio::fs::write(&layer, b"sealed layer")
+            .await
+            .expect("write layer");
+
+        let error = resolve_managed_layer_descriptor(&layer, Some(("sha256:declared", 1)))
+            .await
+            .expect_err("reject stale descriptor");
+
+        assert!(error.to_string().contains("descriptor size mismatch"));
     }
 }
