@@ -22,20 +22,27 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(360);
 /// Timeout for waiting for the daemon to signal readiness.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Capabilities required by the ublk daemon and its in-process storage
+/// backends. `CAP_SYS_ADMIN` is required for ublk device management, while
+/// `CAP_NET_ADMIN` is required by Mooncake's UB bonding provider when it
+/// queries the UB topology while creating an URMA context.
+const DAEMON_CAPABILITIES: [i32; 2] = [linux_cap::CAP_NET_ADMIN, linux_cap::CAP_SYS_ADMIN];
+
 fn configure_daemon_capabilities(command: &mut tokio::process::Command) -> Result<()> {
-    let can_delegate = linux_cap::has_effective_capabilities(&[linux_cap::CAP_SYS_ADMIN])
+    let can_delegate = linux_cap::has_effective_capabilities(&DAEMON_CAPABILITIES)
         .context("inspect process capabilities before spawning ublk daemon")?;
     if !can_delegate {
-        bail!("cannot scope ublk daemon: CAP_SYS_ADMIN is not effective in the server process");
+        bail!(
+            "cannot scope ublk daemon: CAP_NET_ADMIN and CAP_SYS_ADMIN must be effective in the server process"
+        );
     }
     // SAFETY: the pre-exec closure performs only prctl/capset syscalls. The
     // server validates the runtime capability contract before spawning the
     // daemon. Root may have an empty inheritable set, but can populate it in
-    // the child before exec while CAP_SYS_ADMIN is effective.
+    // the child before exec while both required capabilities are effective.
     unsafe {
-        command.pre_exec(|| {
-            linux_cap::configure_current_process_capabilities(&[linux_cap::CAP_SYS_ADMIN])
-        });
+        command
+            .pre_exec(|| linux_cap::configure_current_process_capabilities(&DAEMON_CAPABILITIES));
     }
     Ok(())
 }
