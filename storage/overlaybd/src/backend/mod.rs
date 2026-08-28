@@ -3,6 +3,8 @@ pub mod local;
 #[cfg(feature = "full")]
 pub mod mc;
 #[cfg(feature = "full")]
+pub mod mc_buffer_pool;
+#[cfg(feature = "full")]
 pub mod oss;
 #[cfg(feature = "full")]
 pub mod registryfs_v2;

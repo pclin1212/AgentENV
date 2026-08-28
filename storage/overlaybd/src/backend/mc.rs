@@ -49,6 +49,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use crate::backend::mc_buffer_pool::RegisteredReadBufferPool;
 use crate::config::McConfig;
 use crate::io::virtual_file::VirtualFile;
 
@@ -97,19 +98,7 @@ extern "C" {
 #[derive(Debug)]
 struct Store {
     handle: MoonCakeStore,
-}
-
-struct RegisteredBuffer<'a> {
-    store: &'a Store,
-    buffer: *mut c_void,
-}
-
-impl Drop for RegisteredBuffer<'_> {
-    fn drop(&mut self) {
-        unsafe {
-            mooncake_store_unregister_buffer(self.store.handle, self.buffer);
-        }
-    }
+    registered_read_pool: Option<RegisteredReadBufferPool>,
 }
 
 // Safety: MoonCake C API is thread-safe (internal mutexes).
@@ -117,26 +106,18 @@ unsafe impl Send for Store {}
 unsafe impl Sync for Store {}
 
 impl Store {
-    fn register_buffer(&self, buffer: *mut c_void, size: usize) -> Result<RegisteredBuffer<'_>> {
-        let ret = unsafe { mooncake_store_register_buffer(self.handle, buffer, size) };
-        if ret != 0 {
-            bail!("mooncake_store_register_buffer({buffer:p}, {size}B) failed: ret={ret}");
-        }
-        Ok(RegisteredBuffer {
-            store: self,
-            buffer,
-        })
-    }
-
     fn create() -> Result<Self> {
         let handle = unsafe { mooncake_store_create() };
         if handle.is_null() {
             bail!("mooncake_store_create returned NULL");
         }
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            registered_read_pool: None,
+        })
     }
 
-    fn setup(&self, config: &McConfig) -> Result<()> {
+    fn setup(&mut self, config: &McConfig) -> Result<()> {
         let c_host = CString::new(config.local_hostname.as_str()).context("local_hostname")?;
         let c_meta = CString::new(config.metadata_server.as_str()).context("metadata_server")?;
         let c_proto = CString::new(config.protocol.as_str()).context("protocol")?;
@@ -159,23 +140,56 @@ impl Store {
         if ret != 0 {
             bail!("mooncake_store_setup failed: ret={ret}");
         }
+
+        if matches!(config.protocol.to_ascii_lowercase().as_str(), "ub" | "rdma") {
+            // SAFETY: the pool is owned by this Store and explicitly dropped
+            // before the Mooncake handle is destroyed.
+            self.registered_read_pool = Some(unsafe {
+                RegisteredReadBufferPool::new(
+                    self.handle,
+                    mooncake_store_register_buffer,
+                    mooncake_store_unregister_buffer,
+                )
+            });
+        }
         Ok(())
     }
 
     fn get_into(&self, key: &str, buf: &mut [u8]) -> Result<i64> {
         let c_key = CString::new(key).context("key")?;
-        let _registered = if buf.is_empty() {
-            None
+        let ret = if let Some(pool) = self
+            .registered_read_pool
+            .as_ref()
+            .filter(|_| !buf.is_empty())
+        {
+            let mut registered = pool.acquire(buf.len())?;
+            let ret = unsafe {
+                mooncake_store_get_into(
+                    self.handle,
+                    c_key.as_ptr(),
+                    registered.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            if ret >= 0 {
+                let bytes_read = ret as usize;
+                ensure!(
+                    bytes_read <= buf.len(),
+                    "mooncake_store_get_into('{key}') returned {bytes_read}B for a {}B buffer",
+                    buf.len()
+                );
+                buf[..bytes_read].copy_from_slice(registered.as_slice(bytes_read));
+            }
+            ret
         } else {
-            Some(self.register_buffer(buf.as_mut_ptr() as *mut c_void, buf.len())?)
-        };
-        let ret = unsafe {
-            mooncake_store_get_into(
-                self.handle,
-                c_key.as_ptr(),
-                buf.as_mut_ptr() as *mut c_void,
-                buf.len(),
-            )
+            unsafe {
+                mooncake_store_get_into(
+                    self.handle,
+                    c_key.as_ptr(),
+                    buf.as_mut_ptr() as *mut c_void,
+                    buf.len(),
+                )
+            }
         };
         if ret < 0 {
             bail!("mooncake_store_get_into('{key}') failed: ret={ret}");
@@ -223,6 +237,9 @@ impl Store {
 impl Drop for Store {
     fn drop(&mut self) {
         if !self.handle.is_null() {
+            // Registered regions must be released while the Mooncake handle is
+            // still valid.
+            drop(self.registered_read_pool.take());
             unsafe { mooncake_store_destroy(self.handle) };
             self.handle = std::ptr::null_mut();
         }
@@ -345,7 +362,7 @@ impl McBackend {
     ///
     /// Initialises the store handle and connects to the MoonCake master.
     pub fn new(config: &McConfig) -> Result<Self> {
-        let store = Store::create()?;
+        let mut store = Store::create()?;
         store.setup(config)?;
         Ok(Self {
             inner: Arc::new(McBackendInner { store }),

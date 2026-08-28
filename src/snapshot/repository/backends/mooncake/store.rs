@@ -8,6 +8,7 @@
 use std::ffi::{c_void, CString};
 
 use anyhow::{ensure, Context, Result};
+use overlaybd::backend::mc_buffer_pool::RegisteredReadBufferPool;
 use serde::{Deserialize, Serialize};
 
 use super::config::NormalizedMoonCakeConfig;
@@ -38,28 +39,9 @@ pub struct Store {
     /// Preferred segment names, kept alive for FFI pointer stability across
     /// repeated `put()` calls that reference them in the replicate config.
     preferred_segments: Vec<CString>,
-}
-
-/// RAII guard for memory registered with MoonCake's transfer engine.
-///
-/// UB/RDMA transfers require the caller-provided source and destination
-/// buffers to remain registered for the whole operation. Keeping the guard in
-/// the same stack frame as the FFI call also guarantees that early returns
-/// unregister the buffer.
-struct RegisteredBuffer<'a> {
-    store: &'a Store,
-    buffer: *mut c_void,
-}
-
-impl Drop for RegisteredBuffer<'_> {
-    fn drop(&mut self) {
-        // Best effort in Drop: the data operation's result is more useful to
-        // the caller than an unregister error, and there is no recovery action
-        // available while unwinding or returning early.
-        unsafe {
-            mooncake_store_unregister_buffer(self.store.handle, self.buffer);
-        }
-    }
+    /// UB/RDMA reads use reusable page-aligned registered memory. TCP reads
+    /// continue to use the caller-provided buffer directly.
+    registered_read_pool: Option<RegisteredReadBufferPool>,
 }
 
 // Safety: MoonCake is thread-safe (all C API calls can be made from any
@@ -68,17 +50,6 @@ unsafe impl Send for Store {}
 unsafe impl Sync for Store {}
 
 impl Store {
-    fn register_buffer(&self, buffer: *mut c_void, size: usize) -> Result<RegisteredBuffer<'_>> {
-        let ret = unsafe { mooncake_store_register_buffer(self.handle, buffer, size) };
-        if ret != 0 {
-            anyhow::bail!("mooncake_store_register_buffer({buffer:p}, {size}B) failed: ret={ret}");
-        }
-        Ok(RegisteredBuffer {
-            store: self,
-            buffer,
-        })
-    }
-
     /// Create a new uninitialized MoonCake store handle.
     pub fn create() -> Result<Self> {
         let handle = unsafe { mooncake_store_create() };
@@ -88,6 +59,7 @@ impl Store {
         Ok(Self {
             handle,
             preferred_segments: Vec::new(),
+            registered_read_pool: None,
         })
     }
 
@@ -126,22 +98,28 @@ impl Store {
         if ret != 0 {
             anyhow::bail!("mooncake_store_setup failed: ret={ret}");
         }
+
+        if matches!(config.protocol.to_ascii_lowercase().as_str(), "ub" | "rdma") {
+            // SAFETY: the pool is owned by this Store and explicitly dropped
+            // before the Mooncake handle is destroyed.
+            self.registered_read_pool = Some(unsafe {
+                RegisteredReadBufferPool::new(
+                    self.handle,
+                    mooncake_store_register_buffer,
+                    mooncake_store_unregister_buffer,
+                )
+            });
+        }
         Ok(())
     }
 
     /// Put raw bytes under a key.
     ///
-    /// The `value` pointer is registered for the duration of the operation and
-    /// passed directly to MoonCake without an intermediate copy. Registration
-    /// is required when the selected replica uses UB/RDMA.
+    /// Mooncake's copy-style `put` API copies `value` into its setup-time
+    /// registered allocator before submitting the transfer, so arbitrary Rust
+    /// slices are valid for TCP, RDMA, and UB.
     pub fn put(&self, key: &str, value: &[u8]) -> Result<()> {
         let c_key = CString::new(key).context("key")?;
-
-        let _registered = if value.is_empty() {
-            None
-        } else {
-            Some(self.register_buffer(value.as_ptr() as *mut c_void, value.len())?)
-        };
 
         let seg_ptrs: Vec<*const std::ffi::c_char> = self
             .preferred_segments
@@ -184,18 +162,39 @@ impl Store {
     /// Returns the number of bytes actually read.
     pub fn get_into(&self, key: &str, buf: &mut [u8]) -> Result<i64> {
         let c_key = CString::new(key).context("key")?;
-        let _registered = if buf.is_empty() {
-            None
+        let ret = if let Some(pool) = self
+            .registered_read_pool
+            .as_ref()
+            .filter(|_| !buf.is_empty())
+        {
+            let mut registered = pool.acquire(buf.len())?;
+            let ret = unsafe {
+                mooncake_store_get_into(
+                    self.handle,
+                    c_key.as_ptr(),
+                    registered.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            if ret >= 0 {
+                let bytes_read = ret as usize;
+                ensure!(
+                    bytes_read <= buf.len(),
+                    "mooncake_store_get_into('{key}') returned {bytes_read}B for a {}B buffer",
+                    buf.len()
+                );
+                buf[..bytes_read].copy_from_slice(registered.as_slice(bytes_read));
+            }
+            ret
         } else {
-            Some(self.register_buffer(buf.as_mut_ptr() as *mut c_void, buf.len())?)
-        };
-        let ret = unsafe {
-            mooncake_store_get_into(
-                self.handle,
-                c_key.as_ptr(),
-                buf.as_mut_ptr() as *mut std::ffi::c_void,
-                buf.len(),
-            )
+            unsafe {
+                mooncake_store_get_into(
+                    self.handle,
+                    c_key.as_ptr(),
+                    buf.as_mut_ptr() as *mut c_void,
+                    buf.len(),
+                )
+            }
         };
         if ret < 0 {
             anyhow::bail!("mooncake_store_get_into('{key}') failed: ret={ret}");
@@ -347,6 +346,9 @@ impl Store {
 impl Drop for Store {
     fn drop(&mut self) {
         if !self.handle.is_null() {
+            // Registered regions must be released while the Mooncake handle is
+            // still valid.
+            drop(self.registered_read_pool.take());
             unsafe { mooncake_store_destroy(self.handle) };
             self.handle = std::ptr::null_mut();
         }
