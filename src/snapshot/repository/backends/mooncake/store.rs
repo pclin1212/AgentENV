@@ -5,7 +5,7 @@
 //! are synchronous — use [`super::client::MoonCakeStoreClient`] for async access
 //! via `spawn_blocking`.
 
-use std::ffi::CString;
+use std::ffi::{c_void, CString};
 
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -40,12 +40,45 @@ pub struct Store {
     preferred_segments: Vec<CString>,
 }
 
+/// RAII guard for memory registered with MoonCake's transfer engine.
+///
+/// UB/RDMA transfers require the caller-provided source and destination
+/// buffers to remain registered for the whole operation. Keeping the guard in
+/// the same stack frame as the FFI call also guarantees that early returns
+/// unregister the buffer.
+struct RegisteredBuffer<'a> {
+    store: &'a Store,
+    buffer: *mut c_void,
+}
+
+impl Drop for RegisteredBuffer<'_> {
+    fn drop(&mut self) {
+        // Best effort in Drop: the data operation's result is more useful to
+        // the caller than an unregister error, and there is no recovery action
+        // available while unwinding or returning early.
+        unsafe {
+            mooncake_store_unregister_buffer(self.store.handle, self.buffer);
+        }
+    }
+}
+
 // Safety: MoonCake is thread-safe (all C API calls can be made from any
 // thread). The C++ implementation uses internal mutexes for concurrent access.
 unsafe impl Send for Store {}
 unsafe impl Sync for Store {}
 
 impl Store {
+    fn register_buffer(&self, buffer: *mut c_void, size: usize) -> Result<RegisteredBuffer<'_>> {
+        let ret = unsafe { mooncake_store_register_buffer(self.handle, buffer, size) };
+        if ret != 0 {
+            anyhow::bail!("mooncake_store_register_buffer({buffer:p}, {size}B) failed: ret={ret}");
+        }
+        Ok(RegisteredBuffer {
+            store: self,
+            buffer,
+        })
+    }
+
     /// Create a new uninitialized MoonCake store handle.
     pub fn create() -> Result<Self> {
         let handle = unsafe { mooncake_store_create() };
@@ -98,10 +131,17 @@ impl Store {
 
     /// Put raw bytes under a key.
     ///
-    /// The `value` pointer is passed directly to MoonCake — no intermediate
-    /// copy in this wrapper layer.
+    /// The `value` pointer is registered for the duration of the operation and
+    /// passed directly to MoonCake without an intermediate copy. Registration
+    /// is required when the selected replica uses UB/RDMA.
     pub fn put(&self, key: &str, value: &[u8]) -> Result<()> {
         let c_key = CString::new(key).context("key")?;
+
+        let _registered = if value.is_empty() {
+            None
+        } else {
+            Some(self.register_buffer(value.as_ptr() as *mut c_void, value.len())?)
+        };
 
         let seg_ptrs: Vec<*const std::ffi::c_char> = self
             .preferred_segments
@@ -144,6 +184,11 @@ impl Store {
     /// Returns the number of bytes actually read.
     pub fn get_into(&self, key: &str, buf: &mut [u8]) -> Result<i64> {
         let c_key = CString::new(key).context("key")?;
+        let _registered = if buf.is_empty() {
+            None
+        } else {
+            Some(self.register_buffer(buf.as_mut_ptr() as *mut c_void, buf.len())?)
+        };
         let ret = unsafe {
             mooncake_store_get_into(
                 self.handle,

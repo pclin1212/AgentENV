@@ -56,8 +56,7 @@ impl MoonCakeSnapshotRepository {
         F: FnOnce(&mut Vec<String>),
     {
         let key = MoonCakeArtifactLayout::RECORDS_INDEX_KEY;
-        let ids = self.read_index().await.unwrap_or_default();
-        let mut ids = ids;
+        let mut ids = self.read_index().await?;
         mutate(&mut ids);
         let value = serde_json::to_vec(&ids)
             .map_err(|e| RepositoryError::backend("serialize records index".to_string(), e))?;
@@ -78,7 +77,10 @@ impl MoonCakeSnapshotRepository {
             Ok(data) if data.is_empty() => Ok(Vec::new()),
             Ok(data) => serde_json::from_slice(&data)
                 .map_err(|e| RepositoryError::backend("deserialize records index".to_string(), e)),
-            Err(_) => Ok(Vec::new()),
+            Err(e) => Err(RepositoryError::backend(
+                "read records index".to_string(),
+                e,
+            )),
         }
     }
 
@@ -91,7 +93,7 @@ impl MoonCakeSnapshotRepository {
             Ok(data) => serde_json::from_slice(&data)
                 .map(Some)
                 .map_err(|e| RepositoryError::backend(format!("parse record '{id}'"), e)),
-            Err(_) => Ok(None),
+            Err(e) => Err(RepositoryError::backend(format!("read record '{id}'"), e)),
         }
     }
 
@@ -127,7 +129,7 @@ impl MoonCakeSnapshotRepository {
                     .map_err(|e| RepositoryError::backend(format!("parse alias '{alias}'"), e))?;
                 Ok(Some(id))
             }
-            Err(_) => Ok(None),
+            Err(e) => Err(RepositoryError::backend(format!("read alias '{alias}'"), e)),
         }
     }
 
@@ -526,7 +528,7 @@ impl SnapshotRepository for MoonCakeSnapshotRepository {
 
         for id_str in &ids {
             if let Ok(parsed) = SnapshotId::parse(id_str) {
-                if let Ok(Some(record)) = self.read_record(&parsed).await {
+                if let Some(record) = self.read_record(&parsed).await? {
                     if Self::matches_record_filter(&record, &filter) {
                         records.push(record);
                     }

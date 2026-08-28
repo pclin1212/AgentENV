@@ -79,6 +79,12 @@ extern "C" {
     fn mooncake_store_get_size(store: MoonCakeStore, key: *const c_char) -> i64;
     /// Returns 1 if the key exists, 0 if not, < 0 on error.
     fn mooncake_store_is_exist(store: MoonCakeStore, key: *const c_char) -> c_int;
+    fn mooncake_store_register_buffer(
+        store: MoonCakeStore,
+        buffer: *mut c_void,
+        size: usize,
+    ) -> c_int;
+    fn mooncake_store_unregister_buffer(store: MoonCakeStore, buffer: *mut c_void) -> c_int;
 }
 
 // ── Store wrapper ──────────────────────────────────────────────────────────
@@ -93,11 +99,35 @@ struct Store {
     handle: MoonCakeStore,
 }
 
+struct RegisteredBuffer<'a> {
+    store: &'a Store,
+    buffer: *mut c_void,
+}
+
+impl Drop for RegisteredBuffer<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            mooncake_store_unregister_buffer(self.store.handle, self.buffer);
+        }
+    }
+}
+
 // Safety: MoonCake C API is thread-safe (internal mutexes).
 unsafe impl Send for Store {}
 unsafe impl Sync for Store {}
 
 impl Store {
+    fn register_buffer(&self, buffer: *mut c_void, size: usize) -> Result<RegisteredBuffer<'_>> {
+        let ret = unsafe { mooncake_store_register_buffer(self.handle, buffer, size) };
+        if ret != 0 {
+            bail!("mooncake_store_register_buffer({buffer:p}, {size}B) failed: ret={ret}");
+        }
+        Ok(RegisteredBuffer {
+            store: self,
+            buffer,
+        })
+    }
+
     fn create() -> Result<Self> {
         let handle = unsafe { mooncake_store_create() };
         if handle.is_null() {
@@ -134,6 +164,11 @@ impl Store {
 
     fn get_into(&self, key: &str, buf: &mut [u8]) -> Result<i64> {
         let c_key = CString::new(key).context("key")?;
+        let _registered = if buf.is_empty() {
+            None
+        } else {
+            Some(self.register_buffer(buf.as_mut_ptr() as *mut c_void, buf.len())?)
+        };
         let ret = unsafe {
             mooncake_store_get_into(
                 self.handle,

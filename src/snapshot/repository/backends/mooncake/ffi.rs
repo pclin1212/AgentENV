@@ -65,4 +65,13 @@ extern "C" {
         pattern: *const c_char,
         force: c_int,
     ) -> i64;
+
+    // ── Buffer registration (required by UB/RDMA transfers) ─────────────
+
+    pub fn mooncake_store_register_buffer(
+        store: MoonCakeStore,
+        buffer: *mut c_void,
+        size: usize,
+    ) -> c_int;
+    pub fn mooncake_store_unregister_buffer(store: MoonCakeStore, buffer: *mut c_void) -> c_int;
 }
