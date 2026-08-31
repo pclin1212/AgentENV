@@ -212,37 +212,50 @@ def parse_upload_line(
 def parse_stage_line(
     line: str, source_file: str, line_number: int
 ) -> StageRecord | None:
-    # Restrict the additive breakdown to the user-facing snapshot-create API.
-    # Template builds, automatic pause publication, and plain pause emit many
-    # of the same nested stage names but belong to different end-to-end calls.
-    if SNAPSHOT_API_SPAN not in line:
+    # Publishing stays in the HTTP request span, while capture runs through an
+    # independently instrumented/cancellation-safe orchestrator task and may
+    # retain only the capture_snapshot span. Accept both contexts here and
+    # apply the appropriate one to each stage below.
+    in_snapshot_api = SNAPSHOT_API_SPAN in line
+    in_snapshot_capture = "capture_snapshot" in line
+    if not in_snapshot_api and not in_snapshot_capture:
         return None
     message, fields = parse_log_line(line)
     operation = str(fields.get("operation", ""))
     raw_stage = str(fields.get("stage", ""))
     stage = ""
 
-    if message == SNAPSHOT_CAPTURED_MESSAGE and operation == "snapshot":
+    if (
+        message == SNAPSHOT_CAPTURED_MESSAGE
+        and operation == "snapshot"
+        and in_snapshot_capture
+    ):
         stage = "capture_total"
     elif message == SANDBOX_STAGE_MESSAGE:
-        if operation == "snapshot" and raw_stage == "publish":
+        if operation == "snapshot" and raw_stage == "publish" and in_snapshot_api:
             stage = "publish_total"
-        elif operation == "snapshot" and raw_stage in {
-            "backend_snapshot",
-            "fc_vm_resume",
-        }:
+        elif (
+            operation == "snapshot"
+            and raw_stage in {"backend_snapshot", "fc_vm_resume"}
+            and in_snapshot_capture
+        ):
             stage = raw_stage
-        elif operation == "pause" and raw_stage in {
-            "fc_vm_pause",
-            "memory_to_overlaybd",
-            "rootfs_snapshot",
-            "extra_drives",
-        }:
+        elif (
+            operation == "pause"
+            and raw_stage
+            in {
+                "fc_vm_pause",
+                "memory_to_overlaybd",
+                "rootfs_snapshot",
+                "extra_drives",
+            }
+            and in_snapshot_capture
+        ):
             # These Firecracker events use operation="pause" even when they
-            # run inside snapshot create. The API-span check above excludes
+            # run inside snapshot create. Requiring capture_snapshot excludes
             # events from standalone pause.
             stage = raw_stage
-    elif message == PUBLISH_STAGE_MESSAGE:
+    elif message == PUBLISH_STAGE_MESSAGE and in_snapshot_api:
         component = str(fields.get("component", ""))
         if component == "manager" and raw_stage == "total":
             stage = "manager_publish_total"
