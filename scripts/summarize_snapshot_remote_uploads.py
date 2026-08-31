@@ -3,6 +3,8 @@
 
 This script reads AgentENV server logs directly. It intentionally does not
 consume replay-aenv results, because those results measure end-to-end latency.
+In addition to upload throughput, it derives a server-side end-to-end
+approximation for the user-facing snapshot-create API from existing stage logs.
 
 Comparable metrics:
 
@@ -37,6 +39,10 @@ FIELD_RE = re.compile(
 
 MOONCAKE_MESSAGE = "snapshot publish layer processed"
 OSS_MESSAGE = "oss file uploaded"
+SANDBOX_STAGE_MESSAGE = "sandbox stage elapsed"
+SNAPSHOT_CAPTURED_MESSAGE = "snapshot captured"
+PUBLISH_STAGE_MESSAGE = "snapshot publish stage elapsed"
+SNAPSHOT_API_SPAN = "sandboxes_sandbox_id_snapshots_post"
 
 OSS_ARTIFACTS = {
     "rootfs_layer": "rootfs",
@@ -59,6 +65,17 @@ class UploadRecord:
     digest: str = ""
     read_ms: float = 0.0
     upload_ms: float = 0.0
+    snapshot_api: bool = False
+
+
+@dataclass(frozen=True)
+class StageRecord:
+    stage: str
+    elapsed_ms: float
+    source_file: str
+    line_number: int
+    sandbox_id: str = ""
+    snapshot_id: str = ""
 
 
 def parse_bool(value: object) -> bool:
@@ -127,6 +144,12 @@ def parse_log_line(line: str) -> tuple[str, dict[str, object]]:
         return MOONCAKE_MESSAGE, fields
     if OSS_MESSAGE in line:
         return OSS_MESSAGE, fields
+    if SANDBOX_STAGE_MESSAGE in line:
+        return SANDBOX_STAGE_MESSAGE, fields
+    if SNAPSHOT_CAPTURED_MESSAGE in line:
+        return SNAPSHOT_CAPTURED_MESSAGE, fields
+    if PUBLISH_STAGE_MESSAGE in line:
+        return PUBLISH_STAGE_MESSAGE, fields
     return "", fields
 
 
@@ -163,6 +186,7 @@ def parse_upload_line(
             snapshot_id=str(fields.get("snapshot_id", "")),
             layer_index=layer_index,
             digest=str(fields.get("digest", "")),
+            snapshot_api=SNAPSHOT_API_SPAN in line,
         )
 
     if message == OSS_MESSAGE:
@@ -179,9 +203,64 @@ def parse_upload_line(
             line_number=line_number,
             snapshot_id=str(fields.get("snapshot_id", "")),
             key=str(fields.get("key", "")),
+            snapshot_api=SNAPSHOT_API_SPAN in line,
         )
 
     return None
+
+
+def parse_stage_line(
+    line: str, source_file: str, line_number: int
+) -> StageRecord | None:
+    # Restrict the additive breakdown to the user-facing snapshot-create API.
+    # Template builds, automatic pause publication, and plain pause emit many
+    # of the same nested stage names but belong to different end-to-end calls.
+    if SNAPSHOT_API_SPAN not in line:
+        return None
+    message, fields = parse_log_line(line)
+    operation = str(fields.get("operation", ""))
+    raw_stage = str(fields.get("stage", ""))
+    stage = ""
+
+    if message == SNAPSHOT_CAPTURED_MESSAGE and operation == "snapshot":
+        stage = "capture_total"
+    elif message == SANDBOX_STAGE_MESSAGE:
+        if operation == "snapshot" and raw_stage == "publish":
+            stage = "publish_total"
+        elif operation == "snapshot" and raw_stage in {
+            "backend_snapshot",
+            "fc_vm_resume",
+        }:
+            stage = raw_stage
+        elif operation == "pause" and raw_stage in {
+            "fc_vm_pause",
+            "memory_to_overlaybd",
+            "rootfs_snapshot",
+            "extra_drives",
+        }:
+            # These Firecracker events use operation="pause" even when they
+            # run inside snapshot create. The API-span check above excludes
+            # events from standalone pause.
+            stage = raw_stage
+    elif message == PUBLISH_STAGE_MESSAGE:
+        component = str(fields.get("component", ""))
+        if component == "manager" and raw_stage == "total":
+            stage = "manager_publish_total"
+        elif component == "manager" and raw_stage == "repository_publish":
+            stage = "repository_publish"
+        elif component == "manager" and raw_stage == "p2p_publish":
+            stage = "p2p_publish"
+
+    if not stage:
+        return None
+    return StageRecord(
+        stage=stage,
+        elapsed_ms=parse_float(fields.get("elapsed_ms")),
+        source_file=source_file,
+        line_number=line_number,
+        sandbox_id=str(fields.get("sandbox_id", "")),
+        snapshot_id=str(fields.get("snapshot_id", "")),
+    )
 
 
 def open_log(path: Path) -> TextIO:
@@ -212,19 +291,49 @@ def expand_log_paths(paths: Iterable[str]) -> list[Path]:
     return result
 
 
-def parse_logs(paths: Iterable[Path]) -> list[UploadRecord]:
+def parse_logs(
+    paths: Iterable[Path],
+) -> tuple[list[UploadRecord], dict[str, list[StageRecord]]]:
     records: list[UploadRecord] = []
+    per_file: list[tuple[Path, list[UploadRecord], list[StageRecord]]] = []
     for path in paths:
+        file_uploads: list[UploadRecord] = []
+        file_stages: list[StageRecord] = []
         try:
             handle = open_log(path)
             with handle:
                 for line_number, line in enumerate(handle, 1):
                     record = parse_upload_line(line, str(path), line_number)
                     if record is not None:
-                        records.append(record)
+                        file_uploads.append(record)
+                    stage = parse_stage_line(line, str(path), line_number)
+                    if stage is not None:
+                        file_stages.append(stage)
         except (OSError, UnicodeError) as error:
             print(f"warning: skip {path}: {error}", file=sys.stderr)
-    return records
+            continue
+        records.extend(file_uploads)
+        per_file.append((path, file_uploads, file_stages))
+
+    detected_backends = {record.backend for record in records}
+    stages_by_backend: dict[str, list[StageRecord]] = defaultdict(list)
+    for path, file_uploads, file_stages in per_file:
+        file_backends = {record.backend for record in file_uploads}
+        if len(file_backends) == 1:
+            backend = next(iter(file_backends))
+        elif not file_backends and len(detected_backends) == 1:
+            backend = next(iter(detected_backends))
+        else:
+            if file_stages:
+                print(
+                    f"warning: cannot assign snapshot stages in {path} to one backend; "
+                    "use one clean log file per backend run",
+                    file=sys.stderr,
+                )
+            continue
+        stages_by_backend[backend].extend(file_stages)
+
+    return records, dict(stages_by_backend)
 
 
 def percentile(values: list[float], quantile: float) -> float:
@@ -273,6 +382,98 @@ def summarize(records: Iterable[UploadRecord]) -> list[dict[str, object]]:
     return summaries
 
 
+def summarize_values(values: list[float]) -> dict[str, object]:
+    total = sum(values)
+    return {
+        "count": len(values),
+        "total_ms": total,
+        "avg_ms": total / len(values) if values else 0.0,
+        "p50_ms": percentile(values, 0.50),
+        "p95_ms": percentile(values, 0.95),
+    }
+
+
+def summarize_end_to_end(
+    records: Iterable[UploadRecord],
+    stages_by_backend: dict[str, list[StageRecord]],
+) -> list[dict[str, object]]:
+    uploads_by_backend: dict[str, list[UploadRecord]] = defaultdict(list)
+    for record in records:
+        uploads_by_backend[record.backend].append(record)
+
+    results: list[dict[str, object]] = []
+    for backend in sorted(set(uploads_by_backend) | set(stages_by_backend)):
+        stage_values: dict[str, list[float]] = defaultdict(list)
+        for record in stages_by_backend.get(backend, []):
+            stage_values[record.stage].append(record.elapsed_ms)
+
+        capture = stage_values["capture_total"]
+        publish = stage_values["publish_total"]
+        publish_source = "api_publish"
+        if not publish:
+            publish = stage_values["manager_publish_total"]
+            publish_source = "manager_total"
+
+        capture_stats = summarize_values(capture)
+        publish_stats = summarize_values(publish)
+        backend_snapshot_total = sum(stage_values["backend_snapshot"])
+        remote_layer_total = sum(
+            record.remote_ms for record in uploads_by_backend.get(backend, [])
+        )
+        capture_total = float(capture_stats["total_ms"])
+        publish_total = float(publish_stats["total_ms"])
+        capture_other = capture_total - backend_snapshot_total
+        publish_other = publish_total - remote_layer_total
+        counts_match = bool(capture) and len(capture) == len(publish)
+        sample_count = len(capture) if counts_match else 0
+        estimated_e2e_total = capture_total + publish_total
+
+        nested = {
+            stage: summarize_values(stage_values[stage])
+            for stage in (
+                "backend_snapshot",
+                "fc_vm_pause",
+                "memory_to_overlaybd",
+                "rootfs_snapshot",
+                "extra_drives",
+                "fc_vm_resume",
+                "repository_publish",
+                "p2p_publish",
+                "manager_publish_total",
+            )
+            if stage_values[stage]
+        }
+        results.append(
+            {
+                "backend": backend,
+                "capture": capture_stats,
+                "publish": publish_stats,
+                "publish_source": publish_source,
+                "counts_match": counts_match,
+                "snapshot_count": sample_count,
+                "estimated_e2e_total_ms": estimated_e2e_total,
+                "estimated_e2e_avg_ms": (
+                    estimated_e2e_total / sample_count if sample_count else None
+                ),
+                "remote_layer_total_ms": remote_layer_total,
+                "remote_share_of_publish": (
+                    remote_layer_total / publish_total if publish_total > 0 else None
+                ),
+                "breakdown": {
+                    "backend_snapshot_ms": backend_snapshot_total,
+                    "capture_other_ms": capture_other,
+                    "remote_layer_io_ms": remote_layer_total,
+                    "publish_other_ms": publish_other,
+                },
+                "breakdown_is_additive": (
+                    counts_match and capture_other >= 0 and publish_other >= 0
+                ),
+                "nested_stages": nested,
+            }
+        )
+    return results
+
+
 def format_bytes(size: int) -> str:
     value = float(size)
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
@@ -300,6 +501,81 @@ def render_summary(summaries: list[dict[str, object]]) -> None:
         )
 
 
+def render_end_to_end(results: list[dict[str, object]]) -> None:
+    if not results:
+        return
+
+    print("\nSnapshot end-to-end approximation:")
+    print("  estimated API time = capture_total + publish_total")
+    print("  remote_layer_io includes all uploaded rootfs/memory/attached-drive layers")
+    print(
+        f"{'BACKEND':<10} {'CAP N':>6} {'CAP AVG':>10} {'PUB N':>6} "
+        f"{'PUB AVG':>10} {'E2E AVG':>10} {'REMOTE/PUB':>11}"
+    )
+    print("-" * 80)
+    for result in results:
+        capture = result["capture"]
+        publish = result["publish"]
+        e2e_avg = result["estimated_e2e_avg_ms"]
+        e2e_text = "-" if e2e_avg is None else f"{e2e_avg:.1f}ms"
+        share = result["remote_share_of_publish"]
+        share_text = "-" if share is None else f"{share * 100:.1f}%"
+        print(
+            f"{result['backend']:<10} {capture['count']:>6} "
+            f"{capture['avg_ms']:>8.1f}ms {publish['count']:>6} "
+            f"{publish['avg_ms']:>8.1f}ms {e2e_text:>10} {share_text:>11}"
+        )
+
+    for result in results:
+        print(f"\n[{result['backend']}] non-overlapping aggregate breakdown")
+        if not result["counts_match"]:
+            print(
+                "  warning: capture/publish sample counts differ; an additive "
+                "per-snapshot average cannot be calculated reliably."
+            )
+        breakdown = result["breakdown"]
+        if not result["breakdown_is_additive"]:
+            print(
+                "  warning: stage coverage is inconsistent. The log may include "
+                "unrelated pull/pause uploads or incomplete/rotated records."
+            )
+        denominator = result["estimated_e2e_total_ms"]
+        for label, key in (
+            ("capture/backend_snapshot", "backend_snapshot_ms"),
+            ("capture/other", "capture_other_ms"),
+            ("publish/remote_layer_io", "remote_layer_io_ms"),
+            ("publish/other", "publish_other_ms"),
+        ):
+            value = breakdown[key]
+            share = value / denominator * 100 if denominator > 0 else 0.0
+            print(f"  {label:<28} {value:>10.1f} ms  {share:>6.1f}%")
+        print(f"  {'estimated_e2e':<28} {denominator:>10.1f} ms  100.0%")
+
+        nested = result["nested_stages"]
+        if nested:
+            print("  nested stage detail (already included above; do not add again):")
+            for stage in (
+                "fc_vm_pause",
+                "memory_to_overlaybd",
+                "rootfs_snapshot",
+                "extra_drives",
+                "fc_vm_resume",
+                "backend_snapshot",
+                "repository_publish",
+                "p2p_publish",
+                "manager_publish_total",
+            ):
+                stats = nested.get(stage)
+                if stats is None:
+                    continue
+                print(
+                    f"    {stage:<24} n={stats['count']:<4} "
+                    f"avg={stats['avg_ms']:.1f}ms "
+                    f"p50={stats['p50_ms']:.1f}ms "
+                    f"p95={stats['p95_ms']:.1f}ms"
+                )
+
+
 def render_records(records: Iterable[UploadRecord]) -> None:
     print("\nPer-upload records:")
     print(
@@ -320,7 +596,10 @@ def render_records(records: Iterable[UploadRecord]) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Summarize snapshot managed-layer remote upload time from AgentENV logs."
+        description=(
+            "Summarize snapshot remote uploads and server-side end-to-end stages "
+            "from AgentENV logs."
+        )
     )
     parser.add_argument("logs", nargs="+", help="AgentENV log files or directories")
     parser.add_argument(
@@ -333,7 +612,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--artifact",
         choices=("all", "rootfs", "memory", "attached_drive"),
         default="all",
-        help="only include one managed-layer group (default: all)",
+        help=(
+            "filter the upload table; end-to-end remote I/O always includes "
+            "all managed-layer groups (default: all)"
+        ),
     )
     parser.add_argument(
         "--per-upload", action="store_true", help="also print every matched upload"
@@ -350,30 +632,51 @@ def main() -> int:
         print(f"error: {error}", file=sys.stderr)
         return 2
 
-    records = parse_logs(paths)
+    all_records, stages_by_backend = parse_logs(paths)
+    # Keep the upload table and end-to-end breakdown on the same request
+    # population. This excludes template pulls and automatic pause publish
+    # activity that may be present in the same server log.
+    snapshot_records = [record for record in all_records if record.snapshot_api]
+    records = snapshot_records
     if args.backend != "all":
         records = [record for record in records if record.backend == args.backend]
+        stages_by_backend = {
+            backend: stages
+            for backend, stages in stages_by_backend.items()
+            if backend == args.backend
+        }
     if args.artifact != "all":
         records = [record for record in records if record.artifact == args.artifact]
 
     summaries = summarize(records)
+    e2e_records = snapshot_records
+    if args.backend != "all":
+        e2e_records = [
+            record for record in e2e_records if record.backend == args.backend
+        ]
+    end_to_end = summarize_end_to_end(e2e_records, stages_by_backend)
     if args.json:
         payload: dict[str, object] = {
             "metric_definition": {
                 "mooncake": "read_ms + upload_ms",
                 "s3": "oss file uploaded elapsed_ms",
+                "estimated_end_to_end": "capture_total + publish_total",
+                "scope": "user-facing snapshot create API only",
                 "note": "Mooncake asynchronous SSD offload completion is excluded.",
             },
             "summary": summaries,
+            "end_to_end": end_to_end,
         }
         if args.per_upload:
             payload["uploads"] = [asdict(record) for record in records]
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         print("Metric: Mooncake=read_ms+upload_ms; S3=oss upload elapsed_ms")
+        print("Scope: user-facing snapshot create API only (pull/pause publish excluded)")
         print("Note: Mooncake asynchronous SSD offload completion is not included.\n")
         if summaries:
             render_summary(summaries)
+            render_end_to_end(end_to_end)
             if args.per_upload:
                 render_records(records)
         else:
