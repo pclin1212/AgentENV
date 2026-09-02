@@ -799,6 +799,7 @@ fn overlaybd_runtime_mc_config(mc: &MoonCakeBackendConfig) -> Result<serde_json:
         "deviceName": mc.device_name.clone().unwrap_or_default(),
         "preferredSegments": mc.preferred_segments.clone().unwrap_or_default(),
         "maxObjectSize": mc.max_object_size.unwrap_or(4_194_304),
+        "localBufferSize": mc.local_buffer_size.unwrap_or(134_217_728),
     }))
 }
 
@@ -841,13 +842,14 @@ fn detect_docker_credential_config() -> Option<PathBuf> {
 mod tests {
     use super::{
         bundled_manifest, ensure_firecracker, ensure_kernel, ensure_tools, file_exists_nonempty,
-        overlaybd_runtime_oss_config, validate_explicit_file, version_output_mentions_exact_token,
-        write_generated_overlaybd_global_configs,
+        overlaybd_runtime_mc_config, overlaybd_runtime_oss_config, validate_explicit_file,
+        version_output_mentions_exact_token, write_generated_overlaybd_global_configs,
     };
     use overlaybd::config::DownloadConfig;
 
     use crate::cfg::{
-        AppConfig, MemorySnapshotConfig, OssBackendConfig, UblkOverlaybdTomlConfig, UblkTomlConfig,
+        AppConfig, MemorySnapshotConfig, MoonCakeBackendConfig, OssBackendConfig,
+        UblkOverlaybdTomlConfig, UblkTomlConfig,
     };
 
     fn sample_oss_config() -> OssBackendConfig {
@@ -863,6 +865,25 @@ mod tests {
             addressing_style: None,
             cache_max_size_gb: Some(4),
         }
+    }
+
+    #[test]
+    fn overlaybd_runtime_mc_config_decouples_chunk_and_transfer_buffer_sizes() {
+        let mc = MoonCakeBackendConfig {
+            metadata_server: "http://127.0.0.1:8080/metadata".to_string(),
+            master_server_addr: "127.0.0.1:50051".to_string(),
+            local_hostname: Some("test-node".to_string()),
+            global_segment_size: None,
+            protocol: None,
+            device_name: None,
+            preferred_segments: None,
+            max_object_size: Some(4 * 1024 * 1024),
+            local_buffer_size: Some(256 * 1024 * 1024),
+        };
+
+        let config = overlaybd_runtime_mc_config(&mc).expect("derive overlaybd mc config");
+        assert_eq!(config["maxObjectSize"], 4 * 1024 * 1024);
+        assert_eq!(config["localBufferSize"], 256 * 1024 * 1024_u64);
     }
 
     fn app_config_with_overlaybd_global_configs(

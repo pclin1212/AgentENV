@@ -261,6 +261,10 @@ pub struct McConfig {
     /// split into fixed-size chunks stored as `{key}/chunk-NNNNNNNN` with a
     /// `{key}/meta` descriptor. Default 4 MiB (matches AgentENV side default).
     pub max_object_size: u32,
+    /// Total MoonCake client transfer staging buffer in bytes. This is shared
+    /// by concurrent operations and is independent from `max_object_size`.
+    /// Default 128 MiB.
+    pub local_buffer_size: u64,
 }
 
 impl Default for McConfig {
@@ -274,7 +278,8 @@ impl Default for McConfig {
             protocol: "tcp".to_string(),
             device_name: String::new(),
             preferred_segments: Vec::new(),
-            max_object_size: 4 * 1024 * 1024, // 4 MiB
+            max_object_size: 4 * 1024 * 1024,     // 4 MiB
+            local_buffer_size: 128 * 1024 * 1024, // 128 MiB
         }
     }
 }
@@ -716,6 +721,17 @@ pub fn validate_global_config(cfg: &GlobalConfig) -> Result<()> {
             !cfg.mc_config.local_hostname.is_empty(),
             "mcConfig.localHostname cannot be empty when mc is enabled"
         );
+        ensure!(
+            cfg.mc_config.local_buffer_size > 0,
+            "mcConfig.localBufferSize must be greater than zero when mc is enabled"
+        );
+        ensure!(
+            cfg.mc_config.max_object_size == 0
+                || cfg.mc_config.local_buffer_size >= u64::from(cfg.mc_config.max_object_size),
+            "mcConfig.localBufferSize ({}) must be at least maxObjectSize ({})",
+            cfg.mc_config.local_buffer_size,
+            cfg.mc_config.max_object_size
+        );
     }
 
     ensure!(cfg.nr_io_rings != 0, "nr_io_rings cannot be zero");
@@ -767,6 +783,15 @@ pub fn validate_image_config(cfg: &ImageConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_mc_config_legacy_json_defaults_local_buffer_size() {
+        let cfg: McConfig = serde_json::from_str(r#"{"enable":false,"maxObjectSize":4194304}"#)
+            .expect("parse legacy mc config");
+
+        assert_eq!(cfg.max_object_size, 4 * 1024 * 1024);
+        assert_eq!(cfg.local_buffer_size, 128 * 1024 * 1024);
+    }
 
     #[test]
     fn test_download_config_legacy_json_defaults_concurrency() {

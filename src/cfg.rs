@@ -400,6 +400,9 @@ pub struct MoonCakeBackendConfig {
     /// Objects larger than this are split into fixed-size chunks. Default 4 MiB.
     /// Set to 0 to disable chunking (all objects stored directly).
     pub max_object_size: Option<u32>,
+    /// Total MoonCake client transfer buffer size in bytes. This is independent
+    /// from `max_object_size`, which only controls object chunking. Default 128 MiB.
+    pub local_buffer_size: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]

@@ -131,7 +131,7 @@ impl Store {
                 c_host.as_ptr(),
                 c_meta.as_ptr(),
                 config.global_segment_size,
-                config.max_object_size as u64, // local_buffer_size for transfer buffer
+                config.local_buffer_size,
                 c_proto.as_ptr(),
                 c_dev.as_ptr(),
                 c_master.as_ptr(),

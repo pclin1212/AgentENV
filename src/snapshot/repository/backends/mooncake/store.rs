@@ -65,9 +65,9 @@ impl Store {
 
     /// Connect to the MoonCake master and initialise the client.
     ///
-    /// The local transfer buffer is sized to the largest direct object;
-    /// `preferred_segments` provides allocation affinity for the local
-    /// node's disk segment.
+    /// The local transfer buffer is an independent shared staging pool;
+    /// `preferred_segments` provides allocation affinity for the local node's
+    /// disk segment.
     pub fn setup(&mut self, config: &NormalizedMoonCakeConfig) -> Result<()> {
         let c_host = CString::new(config.local_hostname.as_str()).context("local_hostname")?;
         let c_meta = CString::new(config.metadata_server.as_str()).context("metadata_server")?;
@@ -89,7 +89,7 @@ impl Store {
                 c_host.as_ptr(),
                 c_meta.as_ptr(),
                 config.global_segment_size,
-                config.max_object_size as u64,
+                config.local_buffer_size,
                 c_proto.as_ptr(),
                 c_dev.as_ptr(),
                 c_master.as_ptr(),
