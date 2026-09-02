@@ -7,11 +7,14 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{ensure, Context, Result};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task;
 
 use super::config::NormalizedMoonCakeConfig;
 use super::store::Store;
+
+const WRITE_PERMIT_UNIT: u64 = 4 * 1024;
 
 /// Async-safe MoonCake store client.
 ///
@@ -21,6 +24,9 @@ pub struct MoonCakeStoreClient {
     store: Arc<Store>,
     /// Max object size in bytes before automatic chunking.
     chunk_size: u32,
+    /// Admission control for MoonCake's setup-time local transfer buffer.
+    write_admission: Arc<Semaphore>,
+    local_buffer_size: u64,
 }
 
 impl MoonCakeStoreClient {
@@ -30,6 +36,10 @@ impl MoonCakeStoreClient {
         Ok(Self {
             store: Arc::new(store),
             chunk_size: config.max_object_size,
+            write_admission: Arc::new(Semaphore::new(write_capacity_units(
+                config.local_buffer_size,
+            ))),
+            local_buffer_size: config.local_buffer_size,
         })
     }
 
@@ -40,6 +50,7 @@ impl MoonCakeStoreClient {
     }
 
     pub async fn put(&self, key: String, value: Vec<u8>) -> Result<()> {
+        let _permit = self.acquire_write_permit(value.len() as u64).await?;
         let store = Arc::clone(&self.store);
         task::spawn_blocking(move || store.put(&key, &value)).await?
     }
@@ -52,10 +63,12 @@ impl MoonCakeStoreClient {
     /// never written) before the `put`, so callers can safely update
     /// mutable keys like record blobs and the catalog index.
     pub async fn put_overwrite(&self, key: String, value: Vec<u8>) -> Result<()> {
+        let _permit = self.acquire_write_permit(value.len() as u64).await?;
         let store = Arc::clone(&self.store);
         task::spawn_blocking(move || {
-            // Best-effort delete — the key may not exist yet, and that's fine.
-            let _ = store.remove(&key, true);
+            // remove() is idempotent for OBJECT_NOT_FOUND, while all other
+            // failures must be preserved instead of being silently ignored.
+            store.remove(&key, true)?;
             store.put(&key, &value)
         })
         .await?
@@ -116,13 +129,20 @@ impl MoonCakeStoreClient {
         self.get(key.to_string()).await
     }
 
-    /// Write an object, automatically splitting large values into chunks.
-    ///
-    /// Uses the `max_object_size` from config as the chunk threshold.
-    pub async fn put_chunked(&self, key: String, value: Vec<u8>) -> Result<()> {
+    /// Write immutable content, accepting a concurrent identical-key writer.
+    pub async fn put_immutable(&self, key: String, value: Vec<u8>) -> Result<bool> {
+        let _permit = self.acquire_write_permit(value.len() as u64).await?;
+        let store = Arc::clone(&self.store);
+        task::spawn_blocking(move || store.put_immutable(&key, &value)).await?
+    }
+
+    /// Write immutable, possibly chunked content with metadata committed last.
+    pub async fn put_chunked_immutable(&self, key: String, value: Vec<u8>) -> Result<bool> {
+        let reservation = chunked_write_reservation(value.len() as u64, self.chunk_size);
+        let _permit = self.acquire_write_permit(reservation).await?;
         let store = Arc::clone(&self.store);
         let chunk_size = self.chunk_size;
-        task::spawn_blocking(move || store.put_chunked(&key, &value, chunk_size)).await?
+        task::spawn_blocking(move || store.put_chunked_immutable(&key, &value, chunk_size)).await?
     }
 
     /// Read a (possibly chunked) object into memory.
@@ -141,5 +161,71 @@ impl MoonCakeStoreClient {
         let len = data.len() as u64;
         tokio::fs::write(dest, &data).await?;
         Ok(len)
+    }
+
+    async fn acquire_write_permit(&self, bytes: u64) -> Result<OwnedSemaphorePermit> {
+        ensure!(
+            bytes <= self.local_buffer_size,
+            "MoonCake write reservation ({bytes} bytes) exceeds local_buffer_size ({} bytes); \
+             increase backend.mooncake.local_buffer_size or reduce max_object_size",
+            self.local_buffer_size
+        );
+        let permits = write_permits(bytes, self.local_buffer_size);
+        Arc::clone(&self.write_admission)
+            .acquire_many_owned(permits)
+            .await
+            .context("MoonCake write admission semaphore closed")
+    }
+}
+
+fn write_capacity_units(local_buffer_size: u64) -> usize {
+    let units = if local_buffer_size < WRITE_PERMIT_UNIT {
+        1
+    } else {
+        local_buffer_size / WRITE_PERMIT_UNIT
+    };
+    usize::try_from(units.min(u64::from(u32::MAX))).unwrap_or(usize::MAX)
+}
+
+fn write_permits(bytes: u64, local_buffer_size: u64) -> u32 {
+    if local_buffer_size < WRITE_PERMIT_UNIT {
+        return 1;
+    }
+    let requested = bytes
+        .max(1)
+        .div_ceil(WRITE_PERMIT_UNIT)
+        .try_into()
+        .unwrap_or(u32::MAX);
+    let capacity = write_capacity_units(local_buffer_size)
+        .try_into()
+        .unwrap_or(u32::MAX);
+    requested.min(capacity)
+}
+
+fn chunked_write_reservation(value_len: u64, chunk_size: u32) -> u64 {
+    if chunk_size == 0 {
+        value_len
+    } else {
+        value_len.min(u64::from(chunk_size))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn large_chunked_object_only_reserves_one_chunk() {
+        assert_eq!(
+            chunked_write_reservation(2 * 1024 * 1024 * 1024, 4 * 1024 * 1024),
+            4 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn admission_rounds_requests_up_and_capacity_down() {
+        assert_eq!(write_capacity_units(10 * 1024 + 1), 2);
+        assert_eq!(write_permits(4097, 10 * 1024 + 1), 2);
+        assert_eq!(write_permits(1, 10 * 1024 + 1), 1);
     }
 }

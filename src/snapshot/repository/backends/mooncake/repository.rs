@@ -2,13 +2,15 @@
 //!
 //! Because MoonCake is a flat key-value store without native prefix listing,
 //! we maintain a `catalog/records-index.json` key whose value is a JSON array
-//! of all snapshot IDs. Every create / delete updates this index atomically
-//! (read-modify-write).
+//! of all snapshot IDs. Mutable catalog operations are serialized within one
+//! AgentENV process; coordinating this index across AgentENV processes remains
+//! a separate multi-node concern.
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use overlaybd::config::{load_image_config as load_overlaybd_image_config, LayerConfig};
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use super::client::MoonCakeStoreClient;
@@ -27,6 +29,9 @@ use crate::snapshot::{
 /// Manages the committed-state layer of the MoonCake snapshot repository.
 pub(crate) struct MoonCakeSnapshotRepository {
     client: MoonCakeStoreClient,
+    /// Serializes catalog read-modify-write transactions within this AgentENV
+    /// process. Layer transfers remain concurrent.
+    catalog_lock: Mutex<()>,
 }
 
 fn now_unix_ms() -> i64 {
@@ -45,18 +50,21 @@ fn validated_alias_key(alias: &str) -> RepositoryResult<String> {
 
 impl MoonCakeSnapshotRepository {
     pub(crate) fn new(client: MoonCakeStoreClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            catalog_lock: Mutex::new(()),
+        }
     }
 
     // ── index helpers ────────────────────────────────────────────────────
 
-    /// Atomically read-modify-write the records index.
-    async fn update_index<F>(&self, mutate: F) -> RepositoryResult<()>
+    /// Read-modify-write the records index while `catalog_lock` is held.
+    async fn update_index_unlocked<F>(&self, mutate: F) -> RepositoryResult<()>
     where
         F: FnOnce(&mut Vec<String>),
     {
         let key = MoonCakeArtifactLayout::RECORDS_INDEX_KEY;
-        let mut ids = self.read_index().await?;
+        let mut ids = self.read_index_unlocked().await?;
         mutate(&mut ids);
         let value = serde_json::to_vec(&ids)
             .map_err(|e| RepositoryError::backend("serialize records index".to_string(), e))?;
@@ -68,7 +76,7 @@ impl MoonCakeSnapshotRepository {
             .map_err(|e| RepositoryError::backend("put records index".to_string(), e))
     }
 
-    async fn read_index(&self) -> RepositoryResult<Vec<String>> {
+    async fn read_index_unlocked(&self) -> RepositoryResult<Vec<String>> {
         match self
             .client
             .get(MoonCakeArtifactLayout::RECORDS_INDEX_KEY.to_string())
@@ -86,7 +94,10 @@ impl MoonCakeSnapshotRepository {
 
     // ── record helpers ───────────────────────────────────────────────────
 
-    async fn read_record(&self, id: &SnapshotId) -> RepositoryResult<Option<SnapshotRecord>> {
+    async fn read_record_unlocked(
+        &self,
+        id: &SnapshotId,
+    ) -> RepositoryResult<Option<SnapshotRecord>> {
         let key = MoonCakeArtifactLayout::record_key(id);
         match self.client.get(key).await {
             Ok(data) if data.is_empty() => Ok(None),
@@ -97,7 +108,7 @@ impl MoonCakeSnapshotRepository {
         }
     }
 
-    async fn write_record(&self, record: &SnapshotRecord) -> RepositoryResult<()> {
+    async fn write_record_unlocked(&self, record: &SnapshotRecord) -> RepositoryResult<()> {
         let key = MoonCakeArtifactLayout::record_key(&record.id);
         let value = serde_json::to_vec_pretty(record)
             .map_err(|e| RepositoryError::backend("serialize record".to_string(), e))?;
@@ -110,7 +121,7 @@ impl MoonCakeSnapshotRepository {
             .map_err(|e| RepositoryError::backend("write record".to_string(), e))
     }
 
-    async fn snapshot_exists(&self, id: &SnapshotId) -> RepositoryResult<bool> {
+    async fn snapshot_exists_unlocked(&self, id: &SnapshotId) -> RepositoryResult<bool> {
         let key = MoonCakeArtifactLayout::record_key(id);
         self.client
             .exists(key)
@@ -120,7 +131,10 @@ impl MoonCakeSnapshotRepository {
 
     // ── alias helpers ────────────────────────────────────────────────────
 
-    async fn load_alias_target(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
+    async fn load_alias_target_unlocked(
+        &self,
+        alias: &str,
+    ) -> RepositoryResult<Option<SnapshotId>> {
         let key = validated_alias_key(alias)?;
         match self.client.get(key).await {
             Ok(data) if data.is_empty() => Ok(None),
@@ -137,17 +151,17 @@ impl MoonCakeSnapshotRepository {
     ///
     /// MoonCake has no conditional-write primitive. We use a read-check-write
     /// approach that is acceptable in single-writer-per-alias deployments.
-    async fn bind_alias(&self, alias: &str, id: &SnapshotId) -> RepositoryResult<()> {
+    async fn bind_alias_unlocked(&self, alias: &str, id: &SnapshotId) -> RepositoryResult<()> {
         let key = validated_alias_key(alias)?;
         let payload = serde_json::to_vec(id)
             .map_err(|e| RepositoryError::backend("serialize alias binding".to_string(), e))?;
 
         // Check current binding.
-        if let Some(existing) = self.load_alias_target(alias).await? {
+        if let Some(existing) = self.load_alias_target_unlocked(alias).await? {
             if existing == *id {
                 return Ok(()); // already bound to us
             }
-            if self.snapshot_exists(&existing).await? {
+            if self.snapshot_exists_unlocked(&existing).await? {
                 return Err(RepositoryError::AliasConflict {
                     alias: alias.to_string(),
                     existing,
@@ -167,6 +181,34 @@ impl MoonCakeSnapshotRepository {
             .map_err(|e| RepositoryError::backend("write alias binding".to_string(), e))?;
 
         Ok(())
+    }
+
+    async fn resolve_alias_unlocked(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
+        let key = validated_alias_key(alias)?;
+        let Some(id) = self.load_alias_target_unlocked(alias).await? else {
+            return Ok(None);
+        };
+
+        if !self.snapshot_exists_unlocked(&id).await? {
+            warn!(alias = %alias, snapshot_id = %id, "cleaning up stale alias pointing to missing snapshot");
+            let _ = self.client.remove(key).await;
+            return Ok(None);
+        }
+
+        Ok(Some(id))
+    }
+
+    async fn get_unlocked(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
+        if let Ok(direct_id) = SnapshotId::parse(id_or_alias) {
+            if let Some(record) = self.read_record_unlocked(&direct_id).await? {
+                return Ok(Some(record));
+            }
+        }
+
+        let Some(resolved_id) = self.resolve_alias_unlocked(id_or_alias).await? else {
+            return Ok(None);
+        };
+        self.read_record_unlocked(&resolved_id).await
     }
 
     fn matches_record_filter(record: &SnapshotRecord, filter: &SnapshotListFilter) -> bool {
@@ -241,14 +283,16 @@ impl SnapshotRepository for MoonCakeSnapshotRepository {
                 reason: "pre-created template snapshots must not already be committed".to_string(),
             });
         }
-        if self.snapshot_exists(&record.id).await? {
+
+        let _catalog_guard = self.catalog_lock.lock().await;
+        if self.snapshot_exists_unlocked(&record.id).await? {
             return Err(RepositoryError::InvalidRequest {
                 reason: format!("snapshot '{}' already exists", record.id),
             });
         }
         if let Some(alias) = record.alias.as_ref() {
-            if let Some(existing) = self.load_alias_target(alias.as_ref()).await? {
-                if existing != record.id && self.snapshot_exists(&existing).await? {
+            if let Some(existing) = self.load_alias_target_unlocked(alias.as_ref()).await? {
+                if existing != record.id && self.snapshot_exists_unlocked(&existing).await? {
                     return Err(RepositoryError::AliasConflict {
                         alias: alias.to_string(),
                         existing,
@@ -258,10 +302,10 @@ impl SnapshotRepository for MoonCakeSnapshotRepository {
             }
         }
 
-        self.write_record(&record).await?;
+        self.write_record_unlocked(&record).await?;
 
         if let Some(alias) = record.alias.as_ref() {
-            if let Err(error) = self.bind_alias(alias.as_ref(), &record.id).await {
+            if let Err(error) = self.bind_alias_unlocked(alias.as_ref(), &record.id).await {
                 // Best-effort rollback.
                 let _ = self
                     .client
@@ -271,7 +315,7 @@ impl SnapshotRepository for MoonCakeSnapshotRepository {
             }
         }
 
-        self.update_index(|ids| ids.push(record.id.to_string()))
+        self.update_index_unlocked(|ids| ids.push(record.id.to_string()))
             .await?;
         Ok(record)
     }
@@ -323,8 +367,9 @@ impl SnapshotRepository for MoonCakeSnapshotRepository {
             "vm_state_upload",
             async {
                 self.client
-                    .put_chunked(vm_state_key, vm_state_bytes)
+                    .put_chunked_immutable(vm_state_key, vm_state_bytes)
                     .await
+                    .map(|_| ())
                     .map_err(|e| {
                         RepositoryError::backend(
                             format!("upload vm_state for snapshot '{id}'"),
@@ -364,8 +409,9 @@ impl SnapshotRepository for MoonCakeSnapshotRepository {
             "manifest_upload",
             async {
                 self.client
-                    .put(manifest_key, persisted_manifest_bytes)
+                    .put_immutable(manifest_key, persisted_manifest_bytes)
                     .await
+                    .map(|_| ())
                     .map_err(|e| {
                         RepositoryError::backend(
                             format!("write firecracker manifest for snapshot '{id}'"),
@@ -421,16 +467,21 @@ impl SnapshotRepository for MoonCakeSnapshotRepository {
             disk_publications: Vec::new(), // MoonCake backend does not publish to registries
         };
 
+        // Serialize the mutable catalog transaction. Large immutable artifact
+        // uploads above remain fully concurrent across snapshots.
+        let catalog_guard = self.catalog_lock.lock().await;
+
         // 5. Bind alias (if present).
         if let Some(ref alias) = metadata.alias {
             let bind_result = time_publish_stage(
                 &snapshot_id,
                 "mooncake",
                 "alias_bind",
-                self.bind_alias(alias.as_ref(), id),
+                self.bind_alias_unlocked(alias.as_ref(), id),
             )
             .await;
             if let Err(e) = bind_result {
+                drop(catalog_guard);
                 let pattern = MoonCakeArtifactLayout::artifact_prefix_regex(id);
                 if let Err(rollback_err) = self.client.remove_by_regex(pattern).await {
                     warn!(snapshot_id = %id, error = %rollback_err, "failed to roll back snapshot artifacts after alias bind failure");
@@ -445,7 +496,7 @@ impl SnapshotRepository for MoonCakeSnapshotRepository {
             &snapshot_id,
             "mooncake",
             "catalog_read",
-            self.read_record(id),
+            self.read_record_unlocked(id),
         )
         .await?;
         let record = if let Some(mut record) = existing_record {
@@ -486,11 +537,11 @@ impl SnapshotRepository for MoonCakeSnapshotRepository {
             &snapshot_id,
             "mooncake",
             "catalog_record_write",
-            self.write_record(&record),
+            self.write_record_unlocked(&record),
         )
         .await?;
         time_publish_stage(&snapshot_id, "mooncake", "catalog_index_update", async {
-            self.update_index(|ids| {
+            self.update_index_unlocked(|ids| {
                 let sid = record.id.to_string();
                 if !ids.contains(&sid) {
                     ids.push(sid);
@@ -499,6 +550,7 @@ impl SnapshotRepository for MoonCakeSnapshotRepository {
             .await
         })
         .await?;
+        drop(catalog_guard);
 
         debug!(snapshot_id = %id, "published snapshot to mooncake");
         Ok(record)
@@ -507,28 +559,18 @@ impl SnapshotRepository for MoonCakeSnapshotRepository {
     }
 
     async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
-        // Try by id first.
-        if let Ok(direct_id) = SnapshotId::parse(id_or_alias) {
-            if let Some(record) = self.read_record(&direct_id).await? {
-                return Ok(Some(record));
-            }
-        }
-
-        // Try by alias.
-        let resolved_id = self.resolve_alias(id_or_alias).await?;
-        let Some(resolved_id) = resolved_id else {
-            return Ok(None);
-        };
-        self.read_record(&resolved_id).await
+        let _catalog_guard = self.catalog_lock.lock().await;
+        self.get_unlocked(id_or_alias).await
     }
 
     async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-        let ids = self.read_index().await?;
+        let _catalog_guard = self.catalog_lock.lock().await;
+        let ids = self.read_index_unlocked().await?;
         let mut records = Vec::with_capacity(ids.len());
 
         for id_str in &ids {
             if let Ok(parsed) = SnapshotId::parse(id_str) {
-                if let Some(record) = self.read_record(&parsed).await? {
+                if let Some(record) = self.read_record_unlocked(&parsed).await? {
                     if Self::matches_record_filter(&record, &filter) {
                         records.push(record);
                     }
@@ -546,65 +588,62 @@ impl SnapshotRepository for MoonCakeSnapshotRepository {
     }
 
     async fn delete(&self, id_or_alias: &str) -> RepositoryResult<()> {
-        let record = match self.get(id_or_alias).await? {
-            Some(r) => r,
-            None => return Ok(()), // idempotent
-        };
-        let id = &record.id;
+        let id = {
+            let _catalog_guard = self.catalog_lock.lock().await;
+            let record = match self.get_unlocked(id_or_alias).await? {
+                Some(record) => record,
+                None => return Ok(()),
+            };
+            let id = record.id.clone();
 
-        // 1. Delete alias binding if it still points to us.
-        if let Some(ref alias) = record.alias {
-            if self.load_alias_target(alias.as_ref()).await?.as_ref() == Some(id) {
-                let alias_key = validated_alias_key(alias.as_ref())?;
-                if let Err(error) = self.client.remove(alias_key).await {
-                    warn!(snapshot_id = %id, alias = %alias, error = %error, "failed to delete alias during snapshot removal");
+            // Delete the alias binding if it still points to this record.
+            if let Some(ref alias) = record.alias {
+                if self
+                    .load_alias_target_unlocked(alias.as_ref())
+                    .await?
+                    .as_ref()
+                    == Some(&id)
+                {
+                    let alias_key = validated_alias_key(alias.as_ref())?;
+                    if let Err(error) = self.client.remove(alias_key).await {
+                        warn!(snapshot_id = %id, alias = %alias, error = %error, "failed to delete alias during snapshot removal");
+                    }
                 }
             }
-        }
 
-        // 2. Delete the catalog record.
-        self.client
-            .remove(MoonCakeArtifactLayout::record_key(id))
-            .await
-            .map_err(|e| RepositoryError::backend("delete record".to_string(), e))?;
+            self.client
+                .remove(MoonCakeArtifactLayout::record_key(&id))
+                .await
+                .map_err(|e| RepositoryError::backend("delete record".to_string(), e))?;
 
-        // 3. Delete all artifacts.
-        let pattern = MoonCakeArtifactLayout::artifact_prefix_regex(id);
+            self.update_index_unlocked(|ids| ids.retain(|item| item != &id.to_string()))
+                .await?;
+            id
+        };
+
+        // Artifact cleanup is outside the catalog lock because it may be
+        // expensive and cannot make the already-removed record visible again.
+        let pattern = MoonCakeArtifactLayout::artifact_prefix_regex(&id);
         if let Err(error) = self.client.remove_by_regex(pattern).await {
             warn!(snapshot_id = %id, error = %error, "failed to delete snapshot artifacts");
         }
-
-        // 4. Remove from index.
-        self.update_index(|ids| ids.retain(|i| i != &id.to_string()))
-            .await?;
 
         debug!(snapshot_id = %id, "deleted snapshot from mooncake");
         Ok(())
     }
 
     async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
-        let key = validated_alias_key(alias)?;
-        let Some(id) = self.load_alias_target(alias).await? else {
-            return Ok(None);
-        };
-
-        // Stale-alias cleanup.
-        if !self.snapshot_exists(&id).await? {
-            warn!(alias = %alias, snapshot_id = %id, "cleaning up stale alias pointing to missing snapshot");
-            let _ = self.client.remove(key).await;
-            return Ok(None);
-        }
-
-        Ok(Some(id))
+        let _catalog_guard = self.catalog_lock.lock().await;
+        self.resolve_alias_unlocked(alias).await
     }
 
     async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
-        let mut record =
-            self.read_record(id)
-                .await?
-                .ok_or_else(|| RepositoryError::SnapshotNotFound {
-                    lookup: id.to_string(),
-                })?;
+        let _catalog_guard = self.catalog_lock.lock().await;
+        let mut record = self.read_record_unlocked(id).await?.ok_or_else(|| {
+            RepositoryError::SnapshotNotFound {
+                lookup: id.to_string(),
+            }
+        })?;
         let now = now_unix_ms();
         let SnapshotSource::Template { build } = &mut record.source else {
             return Err(RepositoryError::InvalidRequest {
@@ -620,7 +659,7 @@ impl SnapshotRepository for MoonCakeSnapshotRepository {
         build.started_at_unix_ms = Some(now);
         build.error_reason = None;
         record.updated_at_unix_ms = now;
-        self.write_record(&record).await?;
+        self.write_record_unlocked(&record).await?;
         Ok(record)
     }
 
@@ -629,12 +668,12 @@ impl SnapshotRepository for MoonCakeSnapshotRepository {
         id: &SnapshotId,
         reason: TemplateBuildErrorReason,
     ) -> RepositoryResult<()> {
-        let mut record =
-            self.read_record(id)
-                .await?
-                .ok_or_else(|| RepositoryError::SnapshotNotFound {
-                    lookup: id.to_string(),
-                })?;
+        let _catalog_guard = self.catalog_lock.lock().await;
+        let mut record = self.read_record_unlocked(id).await?.ok_or_else(|| {
+            RepositoryError::SnapshotNotFound {
+                lookup: id.to_string(),
+            }
+        })?;
         let now = now_unix_ms();
         let SnapshotSource::Template { build } = &mut record.source else {
             return Err(RepositoryError::InvalidRequest {
@@ -645,7 +684,7 @@ impl SnapshotRepository for MoonCakeSnapshotRepository {
         build.finished_at_unix_ms = Some(now);
         build.error_reason = Some(reason);
         record.updated_at_unix_ms = now;
-        self.write_record(&record).await
+        self.write_record_unlocked(&record).await
     }
 }
 
@@ -829,6 +868,7 @@ impl MoonCakeSnapshotRepository {
         let existence_check_ms = existence_check_start.elapsed().as_millis() as u64;
         let mut read_ms = 0;
         let mut upload_ms = 0;
+        let mut uploaded = false;
         if !exists {
             let read_start = Instant::now();
             let data = tokio::fs::read(source).await.map_err(|e| {
@@ -836,9 +876,16 @@ impl MoonCakeSnapshotRepository {
             })?;
             read_ms = read_start.elapsed().as_millis() as u64;
             let upload_start = Instant::now();
-            self.client.put_chunked(key, data).await.map_err(|e| {
-                RepositoryError::backend(format!("upload managed layer '{}'", source.display()), e)
-            })?;
+            uploaded = self
+                .client
+                .put_chunked_immutable(key, data)
+                .await
+                .map_err(|e| {
+                    RepositoryError::backend(
+                        format!("upload managed layer '{}'", source.display()),
+                        e,
+                    )
+                })?;
             upload_ms = upload_start.elapsed().as_millis() as u64;
             debug!(
                 digest = %descriptor.sha256,
@@ -856,7 +903,7 @@ impl MoonCakeSnapshotRepository {
             source = %source.display(),
             digest = %descriptor.sha256,
             size_bytes = descriptor.size,
-            uploaded = !exists,
+            uploaded,
             external = false,
             descriptor_reused,
             digest_ms,

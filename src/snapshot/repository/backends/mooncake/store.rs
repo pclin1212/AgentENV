@@ -14,6 +14,48 @@ use serde::{Deserialize, Serialize};
 use super::config::NormalizedMoonCakeConfig;
 use super::ffi::*;
 
+pub(crate) const MOONCAKE_OBJECT_NOT_FOUND: i64 = -704;
+pub(crate) const MOONCAKE_OBJECT_ALREADY_EXISTS: i64 = -705;
+
+/// Error returned by the MoonCake C API.
+///
+/// Keeping the numeric status as structured data lets higher layers handle
+/// expected outcomes such as immutable-object deduplication without parsing
+/// display strings.
+#[derive(Debug, thiserror::Error)]
+#[error("{operation}({target}) failed: ret={code}")]
+pub(crate) struct MoonCakeStoreError {
+    operation: &'static str,
+    target: String,
+    code: i64,
+}
+
+impl MoonCakeStoreError {
+    fn new(operation: &'static str, target: impl Into<String>, code: i64) -> Self {
+        Self {
+            operation,
+            target: target.into(),
+            code,
+        }
+    }
+
+    pub(crate) fn code(&self) -> i64 {
+        self.code
+    }
+}
+
+pub(crate) fn mooncake_error_code(error: &anyhow::Error) -> Option<i64> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<MoonCakeStoreError>()
+            .map(MoonCakeStoreError::code)
+    })
+}
+
+fn store_error(operation: &'static str, target: impl Into<String>, code: i64) -> anyhow::Error {
+    MoonCakeStoreError::new(operation, target, code).into()
+}
+
 /// Metadata stored under `{key}/meta` for chunked objects.
 ///
 /// When an object exceeds [`super::config::DEFAULT_MAX_OBJECT_SIZE`], it is
@@ -96,7 +138,7 @@ impl Store {
             )
         };
         if ret != 0 {
-            anyhow::bail!("mooncake_store_setup failed: ret={ret}");
+            return Err(store_error("mooncake_store_setup", "client", ret.into()));
         }
 
         if matches!(config.protocol.to_ascii_lowercase().as_str(), "ub" | "rdma") {
@@ -149,10 +191,11 @@ impl Store {
             )
         };
         if ret != 0 {
-            anyhow::bail!(
-                "mooncake_store_put('{key}', {}B) failed: ret={ret}",
-                value.len()
-            );
+            return Err(store_error(
+                "mooncake_store_put",
+                format!("'{key}', {}B", value.len()),
+                ret.into(),
+            ));
         }
         Ok(())
     }
@@ -197,7 +240,11 @@ impl Store {
             }
         };
         if ret < 0 {
-            anyhow::bail!("mooncake_store_get_into('{key}') failed: ret={ret}");
+            return Err(store_error(
+                "mooncake_store_get_into",
+                format!("'{key}'"),
+                ret,
+            ));
         }
         Ok(ret)
     }
@@ -206,16 +253,34 @@ impl Store {
     ///
     /// First queries the object size, then allocates and reads.
     pub fn get(&self, key: &str) -> Result<Vec<u8>> {
-        let size = self.get_size(key)?;
-        if size <= 0 {
-            return Ok(Vec::new());
+        const MAX_READ_ATTEMPTS: usize = 3;
+
+        for attempt in 0..MAX_READ_ATTEMPTS {
+            let Some(size) = self.get_size(key)? else {
+                return Ok(Vec::new());
+            };
+            if size == 0 {
+                return Ok(Vec::new());
+            }
+
+            let mut buf = vec![0u8; size];
+            match self.get_into(key, &mut buf) {
+                Ok(n) => {
+                    buf.truncate(n as usize);
+                    return Ok(buf);
+                }
+                Err(error)
+                    if attempt + 1 < MAX_READ_ATTEMPTS
+                        && mooncake_error_code(&error) == Some(MOONCAKE_OBJECT_NOT_FOUND) =>
+                {
+                    // A mutable catalog object may have been replaced between
+                    // get_size and get_into. Re-query its size and retry.
+                }
+                Err(error) => return Err(error),
+            }
         }
-        let mut buf = vec![0u8; size as usize];
-        let n = self.get_into(key, &mut buf)?;
-        if n >= 0 {
-            buf.truncate(n as usize);
-        }
-        Ok(buf)
+
+        unreachable!("the read loop always returns on its last attempt")
     }
 
     /// Check whether a key exists.
@@ -223,18 +288,33 @@ impl Store {
         let c_key = CString::new(key).context("key")?;
         let ret = unsafe { mooncake_store_is_exist(self.handle, c_key.as_ptr()) };
         if ret < 0 {
-            anyhow::bail!("mooncake_store_is_exist('{key}') failed: ret={ret}");
+            return Err(store_error(
+                "mooncake_store_is_exist",
+                format!("'{key}'"),
+                ret.into(),
+            ));
         }
         Ok(ret == 1)
     }
 
     /// Get the stored object size for a key.
     ///
-    /// Returns -1 if the key does not exist (consistent with the C API).
-    pub fn get_size(&self, key: &str) -> Result<i64> {
+    /// Returns `None` if the key does not exist.
+    pub fn get_size(&self, key: &str) -> Result<Option<usize>> {
         let c_key = CString::new(key).context("key")?;
         let ret = unsafe { mooncake_store_get_size(self.handle, c_key.as_ptr()) };
-        Ok(ret)
+        if ret == MOONCAKE_OBJECT_NOT_FOUND {
+            return Ok(None);
+        }
+        if ret < 0 {
+            return Err(store_error(
+                "mooncake_store_get_size",
+                format!("'{key}'"),
+                ret,
+            ));
+        }
+        let size = usize::try_from(ret).context("MoonCake object size does not fit usize")?;
+        Ok(Some(size))
     }
 
     /// Delete a single key.
@@ -245,8 +325,15 @@ impl Store {
         let ret = unsafe {
             mooncake_store_remove(self.handle, c_key.as_ptr(), if force { 1 } else { 0 })
         };
+        if i64::from(ret) == MOONCAKE_OBJECT_NOT_FOUND {
+            return Ok(());
+        }
         if ret != 0 {
-            anyhow::bail!("mooncake_store_remove('{key}') failed: ret={ret}");
+            return Err(store_error(
+                "mooncake_store_remove",
+                format!("'{key}'"),
+                ret.into(),
+            ));
         }
         Ok(())
     }
@@ -264,22 +351,38 @@ impl Store {
             )
         };
         if ret < 0 {
-            anyhow::bail!("mooncake_store_remove_by_regex('{pattern}') failed: ret={ret}");
+            return Err(store_error(
+                "mooncake_store_remove_by_regex",
+                format!("'{pattern}'"),
+                ret,
+            ));
         }
         Ok(ret)
     }
 
+    /// Put immutable content and treat a concurrent identical-key winner as
+    /// successful deduplication.
+    ///
+    /// Callers must only use this for keys whose bytes can never change.
+    pub fn put_immutable(&self, key: &str, value: &[u8]) -> Result<bool> {
+        match self.put(key, value) {
+            Ok(()) => Ok(true),
+            Err(error) if mooncake_error_code(&error) == Some(MOONCAKE_OBJECT_ALREADY_EXISTS) => {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     // ── Chunked object I/O ──────────────────────────────────────────────
 
-    /// Write an object, automatically chunking it if it exceeds `chunk_size`.
+    /// Write immutable content with chunk-level concurrent deduplication.
     ///
-    /// Small objects (`data.len() <= chunk_size`) are stored directly under
-    /// `key` — this preserves backward compatibility.  Large objects are split
-    /// into `chunk_size`-byte pieces stored as `{key}/chunk-NNNNNNNN` with a
-    /// JSON metadata descriptor at `{key}/meta`.
-    pub fn put_chunked(&self, key: &str, data: &[u8], chunk_size: u32) -> Result<()> {
+    /// Returns `true` when this call published the direct key or chunk
+    /// metadata commit marker, and `false` when another writer won the race.
+    pub fn put_chunked_immutable(&self, key: &str, data: &[u8], chunk_size: u32) -> Result<bool> {
         if chunk_size == 0 || data.len() <= chunk_size as usize {
-            return self.put(key, data);
+            return self.put_immutable(key, data);
         }
 
         let chunk_count = data.len().div_ceil(chunk_size as usize) as u32;
@@ -289,20 +392,16 @@ impl Store {
             chunk_size,
         };
 
-        // 1. Write metadata descriptor.
-        let meta_key = format!("{key}/meta");
-        let meta_json = serde_json::to_vec(&meta).context("serialize chunk metadata")?;
-        self.put(&meta_key, &meta_json)?;
-
-        // 2. Write data chunks sequentially.
         for i in 0..chunk_count {
             let start = i as usize * chunk_size as usize;
             let end = std::cmp::min(start + chunk_size as usize, data.len());
             let chunk_key = format!("{key}/chunk-{i:08x}");
-            self.put(&chunk_key, &data[start..end])?;
+            self.put_immutable(&chunk_key, &data[start..end])?;
         }
 
-        Ok(())
+        let meta_key = format!("{key}/meta");
+        let meta_json = serde_json::to_vec(&meta).context("serialize chunk metadata")?;
+        self.put_immutable(&meta_key, &meta_json)
     }
 
     /// Read a (possibly chunked) object into a `Vec<u8>`.
@@ -352,5 +451,19 @@ impl Drop for Store {
             unsafe { mooncake_store_destroy(self.handle) };
             self.handle = std::ptr::null_mut();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_mooncake_error_code_through_context() {
+        let error =
+            store_error("mooncake_store_put", "'key', 4B", -600).context("upload managed layer");
+
+        assert_eq!(mooncake_error_code(&error), Some(-600));
+        assert!(error.to_string().contains("upload managed layer"));
     }
 }
