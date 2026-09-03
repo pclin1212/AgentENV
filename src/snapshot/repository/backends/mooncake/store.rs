@@ -161,6 +161,23 @@ impl Store {
     /// registered allocator before submitting the transfer, so arbitrary Rust
     /// slices are valid for TCP, RDMA, and UB.
     pub fn put(&self, key: &str, value: &[u8]) -> Result<()> {
+        self.put_with_pinning(key, value, true, false)
+    }
+
+    /// Put control-plane metadata that must not be removed by memory eviction.
+    ///
+    /// Explicit repository deletion still works because it uses forced remove.
+    pub fn put_hard_pinned(&self, key: &str, value: &[u8]) -> Result<()> {
+        self.put_with_pinning(key, value, false, true)
+    }
+
+    fn put_with_pinning(
+        &self,
+        key: &str,
+        value: &[u8],
+        with_soft_pin: bool,
+        with_hard_pin: bool,
+    ) -> Result<()> {
         let c_key = CString::new(key).context("key")?;
 
         let seg_ptrs: Vec<*const std::ffi::c_char> = self
@@ -171,8 +188,8 @@ impl Store {
 
         let config = MoonCakeReplicateConfig {
             replica_num: 1,
-            with_soft_pin: 1,
-            with_hard_pin: 0,
+            with_soft_pin: i32::from(with_soft_pin),
+            with_hard_pin: i32::from(with_hard_pin),
             preferred_segments: if seg_ptrs.is_empty() {
                 std::ptr::null()
             } else {

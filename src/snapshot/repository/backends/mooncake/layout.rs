@@ -13,7 +13,8 @@ use crate::snapshot::SnapshotId;
 /// ```text
 /// catalog/records/{id}.json       — SnapshotRecord JSON
 /// catalog/aliases/{name}.json     — Alias → SnapshotId mapping
-/// catalog/records-index.json      — JSON array of all snapshot IDs
+/// catalog/records-index.json      — legacy JSON array of all snapshot IDs
+/// catalog/records-index-{0,1}.json — redundant versioned snapshot indexes
 /// artifacts/{id}/vm_state.bin     — Firecracker VM state
 /// artifacts/{id}/firecracker-manifest.json
 /// artifacts/{id}/mem_image.json
@@ -22,8 +23,20 @@ use crate::snapshot::SnapshotId;
 pub(crate) struct MoonCakeArtifactLayout;
 
 impl MoonCakeArtifactLayout {
-    /// Single-key workaround for MoonCake's lack of native key listing.
+    /// Legacy single-key workaround for MoonCake's lack of native key listing.
+    ///
+    /// New writes use [`Self::RECORDS_INDEX_SLOT_KEYS`]. This key remains a
+    /// read-only migration fallback for repositories created by older builds.
     pub const RECORDS_INDEX_KEY: &'static str = "catalog/records-index.json";
+
+    /// Failure-safe catalog index slots.
+    ///
+    /// An update overwrites only the older slot, leaving the newest valid slot
+    /// untouched until the replacement has committed successfully.
+    pub const RECORDS_INDEX_SLOT_KEYS: [&'static str; 2] = [
+        "catalog/records-index-0.json",
+        "catalog/records-index-1.json",
+    ];
 
     pub fn record_key(id: &SnapshotId) -> String {
         format!("catalog/records/{id}.json")

@@ -49,27 +49,20 @@ impl MoonCakeStoreClient {
         Ok(store)
     }
 
-    pub async fn put(&self, key: String, value: Vec<u8>) -> Result<()> {
+    /// Put non-evictable control-plane metadata.
+    pub async fn put_hard_pinned(&self, key: String, value: Vec<u8>) -> Result<()> {
         let _permit = self.acquire_write_permit(value.len() as u64).await?;
         let store = Arc::clone(&self.store);
-        task::spawn_blocking(move || store.put(&key, &value)).await?
+        task::spawn_blocking(move || store.put_hard_pinned(&key, &value)).await?
     }
 
-    /// Put a key-value pair, removing any existing entry first.
-    ///
-    /// MoonCake's `PutStart` rejects overwrites of existing keys with
-    /// `OBJECT_ALREADY_EXISTS`. This method works around that by issuing a
-    /// best-effort `remove` (ignoring `OBJECT_NOT_FOUND` when the key was
-    /// never written) before the `put`, so callers can safely update
-    /// mutable keys like record blobs and the catalog index.
-    pub async fn put_overwrite(&self, key: String, value: Vec<u8>) -> Result<()> {
+    /// Replace non-evictable control-plane metadata.
+    pub async fn put_overwrite_hard_pinned(&self, key: String, value: Vec<u8>) -> Result<()> {
         let _permit = self.acquire_write_permit(value.len() as u64).await?;
         let store = Arc::clone(&self.store);
         task::spawn_blocking(move || {
-            // remove() is idempotent for OBJECT_NOT_FOUND, while all other
-            // failures must be preserved instead of being silently ignored.
             store.remove(&key, true)?;
-            store.put(&key, &value)
+            store.put_hard_pinned(&key, &value)
         })
         .await?
     }
@@ -102,11 +95,10 @@ impl MoonCakeStoreClient {
 
     /// Delete a single key.
     ///
-    /// Always forces removal: every object written through this client is
-    /// soft-pinned at put time (and the MoonCake master grants a default KV
-    /// lease), so a non-forced remove would fail with `OBJECT_HAS_LEASE`
-    /// (-706) for any existing object. Forcing is the only correct behaviour
-    /// for explicit deletes in this backend.
+    /// Always forces removal: repository objects are pinned at put time (data
+    /// objects are soft-pinned and catalog objects are hard-pinned), so a
+    /// non-forced remove may fail with `OBJECT_HAS_LEASE` (-706). Forcing is
+    /// the correct behaviour for explicit repository deletes.
     pub async fn remove(&self, key: String) -> Result<()> {
         let store = Arc::clone(&self.store);
         task::spawn_blocking(move || store.remove(&key, true)).await?
@@ -114,8 +106,8 @@ impl MoonCakeStoreClient {
 
     /// Delete all keys matching a regex pattern.
     ///
-    /// See [`remove`](Self::remove): removal is always forced because every
-    /// object carries a lease.
+    /// See [`remove`](Self::remove): removal is always forced because objects
+    /// may carry a lease or hard pin.
     pub async fn remove_by_regex(&self, pattern: String) -> Result<i64> {
         let store = Arc::clone(&self.store);
         task::spawn_blocking(move || store.remove_by_regex(&pattern, true)).await?

@@ -1,10 +1,11 @@
 //! MoonCake-backed [`SnapshotRepository`] implementation.
 //!
 //! Because MoonCake is a flat key-value store without native prefix listing,
-//! we maintain a `catalog/records-index.json` key whose value is a JSON array
-//! of all snapshot IDs. Mutable catalog operations are serialized within one
-//! AgentENV process; coordinating this index across AgentENV processes remains
-//! a separate multi-node concern.
+//! we maintain a redundant, versioned records index. An update overwrites only
+//! the older slot so a failed remove-then-put cannot destroy the last readable
+//! catalog. Mutable catalog operations are serialized within one AgentENV
+//! process; coordinating this index across AgentENV processes remains a
+//! separate multi-node concern.
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -34,6 +35,41 @@ pub(crate) struct MoonCakeSnapshotRepository {
     catalog_lock: Mutex<()>,
 }
 
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct RecordsIndexEnvelope {
+    generation: u64,
+    ids: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordsIndexSource {
+    Empty,
+    Legacy,
+    Slot(usize),
+}
+
+#[derive(Debug)]
+struct LoadedRecordsIndex {
+    generation: u64,
+    ids: Vec<String>,
+    source: RecordsIndexSource,
+}
+
+fn records_index_write_slot(source: RecordsIndexSource) -> usize {
+    match source {
+        RecordsIndexSource::Slot(slot) => 1 - slot,
+        RecordsIndexSource::Empty | RecordsIndexSource::Legacy => 0,
+    }
+}
+
+fn newest_records_index_slot(
+    slots: Vec<(usize, RecordsIndexEnvelope)>,
+) -> Option<(usize, RecordsIndexEnvelope)> {
+    slots
+        .into_iter()
+        .max_by_key(|(slot, envelope)| (envelope.generation, *slot))
+}
+
 fn now_unix_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -59,36 +95,134 @@ impl MoonCakeSnapshotRepository {
     // ── index helpers ────────────────────────────────────────────────────
 
     /// Read-modify-write the records index while `catalog_lock` is held.
+    ///
+    /// Only the slot that does not contain the newest committed generation is
+    /// replaced. The MoonCake replacement may remove its target before a
+    /// failed put, but the other slot remains a complete rollback copy.
     async fn update_index_unlocked<F>(&self, mutate: F) -> RepositoryResult<()>
     where
         F: FnOnce(&mut Vec<String>),
     {
-        let key = MoonCakeArtifactLayout::RECORDS_INDEX_KEY;
-        let mut ids = self.read_index_unlocked().await?;
-        mutate(&mut ids);
-        let value = serde_json::to_vec(&ids)
-            .map_err(|e| RepositoryError::backend("serialize records index".to_string(), e))?;
-        // MoonCake rejects overwrites — the index key persists across
-        // create / publish / delete calls, so every write is an update.
+        let mut index = self.load_index_unlocked().await?;
+        mutate(&mut index.ids);
+        let generation = index.generation.checked_add(1).ok_or_else(|| {
+            RepositoryError::backend(
+                "advance records index generation".to_string(),
+                anyhow::anyhow!("records index generation overflow"),
+            )
+        })?;
+        let value = serde_json::to_vec(&RecordsIndexEnvelope {
+            generation,
+            ids: index.ids,
+        })
+        .map_err(|e| RepositoryError::backend("serialize records index".to_string(), e))?;
+
+        let target_slot = records_index_write_slot(index.source);
+        let key = MoonCakeArtifactLayout::RECORDS_INDEX_SLOT_KEYS[target_slot];
         self.client
-            .put_overwrite(key.to_string(), value)
+            .put_overwrite_hard_pinned(key.to_string(), value)
             .await
             .map_err(|e| RepositoryError::backend("put records index".to_string(), e))
     }
 
     async fn read_index_unlocked(&self) -> RepositoryResult<Vec<String>> {
+        Ok(self.load_index_unlocked().await?.ids)
+    }
+
+    async fn load_index_unlocked(&self) -> RepositoryResult<LoadedRecordsIndex> {
+        let mut valid_slots = Vec::with_capacity(2);
+        let mut first_slot_error = None;
+
+        for (slot, key) in MoonCakeArtifactLayout::RECORDS_INDEX_SLOT_KEYS
+            .iter()
+            .enumerate()
+        {
+            match self.client.get((*key).to_string()).await {
+                Ok(data) if data.is_empty() => {}
+                Ok(data) => match serde_json::from_slice::<RecordsIndexEnvelope>(&data) {
+                    Ok(envelope) => valid_slots.push((slot, envelope)),
+                    Err(error) => {
+                        warn!(key, error = %error, "ignoring unreadable MoonCake records index slot");
+                        first_slot_error.get_or_insert_with(|| {
+                            RepositoryError::backend(
+                                format!("deserialize records index slot '{key}'"),
+                                error,
+                            )
+                        });
+                    }
+                },
+                Err(error) => {
+                    warn!(key, error = %error, "failed to read MoonCake records index slot");
+                    first_slot_error.get_or_insert_with(|| {
+                        RepositoryError::backend(format!("read records index slot '{key}'"), error)
+                    });
+                }
+            }
+        }
+
+        if let Some((slot, envelope)) = newest_records_index_slot(valid_slots) {
+            return Ok(LoadedRecordsIndex {
+                generation: envelope.generation,
+                ids: envelope.ids,
+                source: RecordsIndexSource::Slot(slot),
+            });
+        }
+
+        // Migration fallback for repositories written before redundant index
+        // slots were introduced. Do not modify the legacy object: it remains
+        // the rollback copy until the first slot has committed.
         match self
             .client
             .get(MoonCakeArtifactLayout::RECORDS_INDEX_KEY.to_string())
             .await
         {
-            Ok(data) if data.is_empty() => Ok(Vec::new()),
-            Ok(data) => serde_json::from_slice(&data)
-                .map_err(|e| RepositoryError::backend("deserialize records index".to_string(), e)),
-            Err(e) => Err(RepositoryError::backend(
-                "read records index".to_string(),
-                e,
+            Ok(data) if !data.is_empty() => {
+                let ids = serde_json::from_slice(&data).map_err(|e| {
+                    RepositoryError::backend("deserialize legacy records index".to_string(), e)
+                })?;
+                Ok(LoadedRecordsIndex {
+                    generation: 0,
+                    ids,
+                    source: RecordsIndexSource::Legacy,
+                })
+            }
+            Ok(_) if first_slot_error.is_none() => Ok(LoadedRecordsIndex {
+                generation: 0,
+                ids: Vec::new(),
+                source: RecordsIndexSource::Empty,
+            }),
+            Ok(_) => Err(first_slot_error.expect("checked above")),
+            Err(error) => Err(RepositoryError::backend(
+                "read legacy records index".to_string(),
+                error,
             )),
+        }
+    }
+
+    /// Restore a missing index entry when a caller can still resolve a record
+    /// directly by id or alias. Repair is best-effort so a transient catalog
+    /// write failure never turns an otherwise valid get into an outage.
+    async fn repair_index_entry_unlocked(&self, id: &SnapshotId) {
+        let id_string = id.to_string();
+        match self.read_index_unlocked().await {
+            Ok(ids) if ids.contains(&id_string) => {}
+            Ok(_) => {
+                if let Err(error) = self
+                    .update_index_unlocked(|ids| {
+                        if !ids.contains(&id_string) {
+                            ids.push(id_string);
+                        }
+                    })
+                    .await
+                {
+                    warn!(snapshot_id = %id, error = %error, "failed to repair MoonCake records index entry");
+                } else {
+                    info!(snapshot_id = %id, "repaired MoonCake records index entry from direct lookup");
+                }
+            }
+            Err(error) => {
+                warn!(snapshot_id = %id, error = %error, "could not inspect MoonCake records index for repair");
+            }
         }
     }
 
@@ -116,7 +250,7 @@ impl MoonCakeSnapshotRepository {
         // previous record blob first (create writes a "waiting" record
         // that publish / try_start_build / mark_build_error all replace).
         self.client
-            .put_overwrite(key, value)
+            .put_overwrite_hard_pinned(key, value)
             .await
             .map_err(|e| RepositoryError::backend("write record".to_string(), e))
     }
@@ -176,7 +310,7 @@ impl MoonCakeSnapshotRepository {
         }
 
         self.client
-            .put(key, payload)
+            .put_hard_pinned(key, payload)
             .await
             .map_err(|e| RepositoryError::backend("write alias binding".to_string(), e))?;
 
@@ -201,6 +335,7 @@ impl MoonCakeSnapshotRepository {
     async fn get_unlocked(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
         if let Ok(direct_id) = SnapshotId::parse(id_or_alias) {
             if let Some(record) = self.read_record_unlocked(&direct_id).await? {
+                self.repair_index_entry_unlocked(&record.id).await;
                 return Ok(Some(record));
             }
         }
@@ -208,7 +343,11 @@ impl MoonCakeSnapshotRepository {
         let Some(resolved_id) = self.resolve_alias_unlocked(id_or_alias).await? else {
             return Ok(None);
         };
-        self.read_record_unlocked(&resolved_id).await
+        let record = self.read_record_unlocked(&resolved_id).await?;
+        if let Some(record) = record.as_ref() {
+            self.repair_index_entry_unlocked(&record.id).await;
+        }
+        Ok(record)
     }
 
     fn matches_record_filter(record: &SnapshotRecord, filter: &SnapshotListFilter) -> bool {
@@ -634,7 +773,11 @@ impl SnapshotRepository for MoonCakeSnapshotRepository {
 
     async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
         let _catalog_guard = self.catalog_lock.lock().await;
-        self.resolve_alias_unlocked(alias).await
+        let id = self.resolve_alias_unlocked(alias).await?;
+        if let Some(id) = id.as_ref() {
+            self.repair_index_entry_unlocked(id).await;
+        }
+        Ok(id)
     }
 
     async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
@@ -1042,6 +1185,39 @@ async fn resolve_managed_layer_descriptor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn records_index_update_preserves_newest_slot() {
+        assert_eq!(records_index_write_slot(RecordsIndexSource::Empty), 0);
+        assert_eq!(records_index_write_slot(RecordsIndexSource::Legacy), 0);
+        assert_eq!(records_index_write_slot(RecordsIndexSource::Slot(0)), 1);
+        assert_eq!(records_index_write_slot(RecordsIndexSource::Slot(1)), 0);
+    }
+
+    #[test]
+    fn records_index_reader_selects_highest_committed_generation() {
+        let selected = newest_records_index_slot(vec![
+            (
+                0,
+                RecordsIndexEnvelope {
+                    generation: 11,
+                    ids: vec!["older".to_string()],
+                },
+            ),
+            (
+                1,
+                RecordsIndexEnvelope {
+                    generation: 12,
+                    ids: vec!["newer".to_string()],
+                },
+            ),
+        ])
+        .expect("one valid slot");
+
+        assert_eq!(selected.0, 1);
+        assert_eq!(selected.1.generation, 12);
+        assert_eq!(selected.1.ids, ["newer"]);
+    }
 
     #[test]
     fn inherited_mooncake_memory_layer_remains_managed() {
