@@ -879,6 +879,9 @@ mod tests {
             preferred_segments: None,
             max_object_size: Some(4 * 1024 * 1024),
             local_buffer_size: Some(256 * 1024 * 1024),
+            put_no_space_max_retries: None,
+            put_no_space_retry_initial_backoff_ms: None,
+            put_no_space_retry_max_backoff_ms: None,
         };
 
         let config = overlaybd_runtime_mc_config(&mc).expect("derive overlaybd mc config");

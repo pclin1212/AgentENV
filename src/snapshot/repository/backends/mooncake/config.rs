@@ -34,6 +34,15 @@ pub(crate) const DEFAULT_MAX_OBJECT_SIZE: u32 = 4 * 1024 * 1024; // 4 MiB
 /// Default total transfer staging buffer owned by each MoonCake client.
 pub(crate) const DEFAULT_LOCAL_BUFFER_SIZE: u64 = 128 * 1024 * 1024; // 128 MiB
 
+/// Default retry budget for a PUT rejected while MoonCake is reclaiming space.
+pub(crate) const DEFAULT_PUT_NO_SPACE_MAX_RETRIES: u32 = 12;
+
+/// Default initial backoff for a PUT rejected with NO_AVAILABLE_HANDLE.
+pub(crate) const DEFAULT_PUT_NO_SPACE_RETRY_INITIAL_BACKOFF_MS: u64 = 100;
+
+/// Default maximum base backoff for a PUT rejected with NO_AVAILABLE_HANDLE.
+pub(crate) const DEFAULT_PUT_NO_SPACE_RETRY_MAX_BACKOFF_MS: u64 = 2_000;
+
 #[derive(Debug, Clone)]
 pub(crate) struct NormalizedMoonCakeConfig {
     pub local_hostname: String,
@@ -50,6 +59,12 @@ pub(crate) struct NormalizedMoonCakeConfig {
     /// Total client-side transfer staging buffer. Concurrent operations share
     /// this pool, so it must not be coupled to the per-object chunk size.
     pub local_buffer_size: u64,
+    /// Number of retries after the initial PUT receives NO_AVAILABLE_HANDLE.
+    pub put_no_space_max_retries: u32,
+    /// Initial retry backoff in milliseconds.
+    pub put_no_space_retry_initial_backoff_ms: u64,
+    /// Maximum base retry backoff in milliseconds.
+    pub put_no_space_retry_max_backoff_ms: u64,
 }
 
 impl NormalizedMoonCakeConfig {
@@ -62,6 +77,15 @@ impl NormalizedMoonCakeConfig {
         let local_buffer_size = config
             .local_buffer_size
             .unwrap_or(DEFAULT_LOCAL_BUFFER_SIZE);
+        let put_no_space_max_retries = config
+            .put_no_space_max_retries
+            .unwrap_or(DEFAULT_PUT_NO_SPACE_MAX_RETRIES);
+        let put_no_space_retry_initial_backoff_ms = config
+            .put_no_space_retry_initial_backoff_ms
+            .unwrap_or(DEFAULT_PUT_NO_SPACE_RETRY_INITIAL_BACKOFF_MS);
+        let put_no_space_retry_max_backoff_ms = config
+            .put_no_space_retry_max_backoff_ms
+            .unwrap_or(DEFAULT_PUT_NO_SPACE_RETRY_MAX_BACKOFF_MS);
 
         ensure!(
             local_buffer_size > 0,
@@ -71,6 +95,19 @@ impl NormalizedMoonCakeConfig {
             max_object_size == 0 || local_buffer_size >= u64::from(max_object_size),
             "backend.mooncake.local_buffer_size ({local_buffer_size}) must be at least \
              max_object_size ({max_object_size})"
+        );
+        ensure!(
+            put_no_space_max_retries == 0 || put_no_space_retry_initial_backoff_ms > 0,
+            "backend.mooncake.put_no_space_retry_initial_backoff_ms must be greater than zero \
+             when put_no_space_max_retries is non-zero"
+        );
+        ensure!(
+            put_no_space_max_retries == 0
+                || put_no_space_retry_max_backoff_ms >= put_no_space_retry_initial_backoff_ms,
+            "backend.mooncake.put_no_space_retry_max_backoff_ms \
+             ({put_no_space_retry_max_backoff_ms}) must be at least \
+             put_no_space_retry_initial_backoff_ms \
+             ({put_no_space_retry_initial_backoff_ms})"
         );
 
         Ok(Self {
@@ -83,6 +120,9 @@ impl NormalizedMoonCakeConfig {
             preferred_segments: config.preferred_segments.clone().unwrap_or_default(),
             max_object_size,
             local_buffer_size,
+            put_no_space_max_retries,
+            put_no_space_retry_initial_backoff_ms,
+            put_no_space_retry_max_backoff_ms,
         })
     }
 
@@ -117,6 +157,9 @@ mod tests {
             preferred_segments: None,
             max_object_size: None,
             local_buffer_size: None,
+            put_no_space_max_retries: None,
+            put_no_space_retry_initial_backoff_ms: None,
+            put_no_space_retry_max_backoff_ms: None,
         }
     }
 
@@ -126,6 +169,18 @@ mod tests {
 
         assert_eq!(normalized.max_object_size, DEFAULT_MAX_OBJECT_SIZE);
         assert_eq!(normalized.local_buffer_size, DEFAULT_LOCAL_BUFFER_SIZE);
+        assert_eq!(
+            normalized.put_no_space_max_retries,
+            DEFAULT_PUT_NO_SPACE_MAX_RETRIES
+        );
+        assert_eq!(
+            normalized.put_no_space_retry_initial_backoff_ms,
+            DEFAULT_PUT_NO_SPACE_RETRY_INITIAL_BACKOFF_MS
+        );
+        assert_eq!(
+            normalized.put_no_space_retry_max_backoff_ms,
+            DEFAULT_PUT_NO_SPACE_RETRY_MAX_BACKOFF_MS
+        );
     }
 
     #[test]
@@ -149,5 +204,31 @@ mod tests {
         assert!(error
             .to_string()
             .contains("must be at least max_object_size"));
+    }
+
+    #[test]
+    fn accepts_custom_no_space_retry_policy() {
+        let mut config = config();
+        config.put_no_space_max_retries = Some(5);
+        config.put_no_space_retry_initial_backoff_ms = Some(250);
+        config.put_no_space_retry_max_backoff_ms = Some(4_000);
+
+        let normalized = NormalizedMoonCakeConfig::new(&config).expect("normalize config");
+        assert_eq!(normalized.put_no_space_max_retries, 5);
+        assert_eq!(normalized.put_no_space_retry_initial_backoff_ms, 250);
+        assert_eq!(normalized.put_no_space_retry_max_backoff_ms, 4_000);
+    }
+
+    #[test]
+    fn rejects_invalid_no_space_retry_backoff() {
+        let mut config = config();
+        config.put_no_space_max_retries = Some(1);
+        config.put_no_space_retry_initial_backoff_ms = Some(2_000);
+        config.put_no_space_retry_max_backoff_ms = Some(1_000);
+
+        let error = NormalizedMoonCakeConfig::new(&config).expect_err("invalid config");
+        assert!(error
+            .to_string()
+            .contains("put_no_space_retry_max_backoff_ms"));
     }
 }

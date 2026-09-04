@@ -5,15 +5,22 @@
 //! are synchronous — use [`super::client::MoonCakeStoreClient`] for async access
 //! via `spawn_blocking`.
 
-use std::ffi::{c_void, CString};
+use std::{
+    ffi::{c_void, CString},
+    thread,
+    time::{Duration, Instant},
+};
 
 use anyhow::{ensure, Context, Result};
 use overlaybd::backend::mc_buffer_pool::RegisteredReadBufferPool;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
 
 use super::config::NormalizedMoonCakeConfig;
 use super::ffi::*;
 
+pub(crate) const MOONCAKE_NO_AVAILABLE_HANDLE: i64 = -200;
 pub(crate) const MOONCAKE_OBJECT_NOT_FOUND: i64 = -704;
 pub(crate) const MOONCAKE_OBJECT_ALREADY_EXISTS: i64 = -705;
 
@@ -84,6 +91,15 @@ pub struct Store {
     /// UB/RDMA reads use reusable page-aligned registered memory. TCP reads
     /// continue to use the caller-provided buffer directly.
     registered_read_pool: Option<RegisteredReadBufferPool>,
+    /// Bounded retry policy for transient remote allocation pressure.
+    put_no_space_retry: PutNoSpaceRetryPolicy,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PutNoSpaceRetryPolicy {
+    max_retries: u32,
+    initial_backoff_ms: u64,
+    max_backoff_ms: u64,
 }
 
 // Safety: MoonCake is thread-safe (all C API calls can be made from any
@@ -102,6 +118,11 @@ impl Store {
             handle,
             preferred_segments: Vec::new(),
             registered_read_pool: None,
+            put_no_space_retry: PutNoSpaceRetryPolicy {
+                max_retries: 0,
+                initial_backoff_ms: 0,
+                max_backoff_ms: 0,
+            },
         })
     }
 
@@ -124,6 +145,11 @@ impl Store {
             .map(|s| CString::new(s.as_str()))
             .collect::<std::result::Result<Vec<_>, _>>()
             .context("preferred_segments")?;
+        self.put_no_space_retry = PutNoSpaceRetryPolicy {
+            max_retries: config.put_no_space_max_retries,
+            initial_backoff_ms: config.put_no_space_retry_initial_backoff_ms,
+            max_backoff_ms: config.put_no_space_retry_max_backoff_ms,
+        };
 
         let ret = unsafe {
             mooncake_store_setup(
@@ -198,23 +224,78 @@ impl Store {
             preferred_segments_count: seg_ptrs.len(),
         };
 
-        let ret = unsafe {
-            mooncake_store_put(
-                self.handle,
-                c_key.as_ptr(),
-                value.as_ptr() as *const std::ffi::c_void,
-                value.len(),
-                &config,
-            )
-        };
-        if ret != 0 {
-            return Err(store_error(
-                "mooncake_store_put",
-                format!("'{key}', {}B", value.len()),
-                ret.into(),
-            ));
+        let retry_started = Instant::now();
+        let mut retries = 0;
+        let mut base_backoff_ms = self.put_no_space_retry.initial_backoff_ms;
+
+        loop {
+            let ret = unsafe {
+                mooncake_store_put(
+                    self.handle,
+                    c_key.as_ptr(),
+                    value.as_ptr() as *const std::ffi::c_void,
+                    value.len(),
+                    &config,
+                )
+            };
+            if ret == 0 {
+                if retries > 0 {
+                    info!(
+                        key,
+                        size_bytes = value.len() as u64,
+                        retries,
+                        elapsed_ms = retry_started.elapsed().as_millis() as u64,
+                        "MoonCake PUT recovered after waiting for available space"
+                    );
+                }
+                return Ok(());
+            }
+
+            if i64::from(ret) != MOONCAKE_NO_AVAILABLE_HANDLE
+                || retries >= self.put_no_space_retry.max_retries
+            {
+                let error = store_error(
+                    "mooncake_store_put",
+                    format!("'{key}', {}B", value.len()),
+                    ret.into(),
+                );
+                if i64::from(ret) == MOONCAKE_NO_AVAILABLE_HANDLE && retries > 0 {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "MoonCake PUT still has no available handle after {retries} retries over {}ms",
+                            retry_started.elapsed().as_millis()
+                        )
+                    });
+                }
+                return Err(error);
+            }
+
+            retries += 1;
+            let delay_ms = jittered_backoff_ms(base_backoff_ms);
+            if retries == 1 {
+                warn!(
+                    key,
+                    size_bytes = value.len() as u64,
+                    retry = retries,
+                    max_retries = self.put_no_space_retry.max_retries,
+                    delay_ms,
+                    "MoonCake PUT has no available handle; waiting for eviction before retry"
+                );
+            } else {
+                debug!(
+                    key,
+                    size_bytes = value.len() as u64,
+                    retry = retries,
+                    max_retries = self.put_no_space_retry.max_retries,
+                    delay_ms,
+                    "MoonCake PUT still has no available handle; retrying after backoff"
+                );
+            }
+            thread::sleep(Duration::from_millis(delay_ms));
+            base_backoff_ms = base_backoff_ms
+                .saturating_mul(2)
+                .min(self.put_no_space_retry.max_backoff_ms);
         }
-        Ok(())
     }
 
     /// Read bytes for a key into a pre-allocated buffer.
@@ -459,6 +540,16 @@ impl Store {
     }
 }
 
+/// Equal jitter in `[base / 2, base]` prevents concurrent publishers that hit
+/// the same water mark from retrying in lockstep while preserving the
+/// configured maximum delay.
+fn jittered_backoff_ms(base_backoff_ms: u64) -> u64 {
+    if base_backoff_ms <= 1 {
+        return base_backoff_ms;
+    }
+    rand::rng().random_range(base_backoff_ms.div_ceil(2)..=base_backoff_ms)
+}
+
 impl Drop for Store {
     fn drop(&mut self) {
         if !self.handle.is_null() {
@@ -474,6 +565,16 @@ impl Drop for Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jittered_backoff_stays_within_equal_jitter_window() {
+        for _ in 0..100 {
+            let delay_ms = jittered_backoff_ms(100);
+            assert!((50..=100).contains(&delay_ms));
+        }
+        assert_eq!(jittered_backoff_ms(0), 0);
+        assert_eq!(jittered_backoff_ms(1), 1);
+    }
 
     #[test]
     fn preserves_mooncake_error_code_through_context() {

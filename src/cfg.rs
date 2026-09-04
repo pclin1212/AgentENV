@@ -403,6 +403,15 @@ pub struct MoonCakeBackendConfig {
     /// Total MoonCake client transfer buffer size in bytes. This is independent
     /// from `max_object_size`, which only controls object chunking. Default 128 MiB.
     pub local_buffer_size: Option<u64>,
+    /// Number of retries after MoonCake returns NO_AVAILABLE_HANDLE (-200).
+    /// The initial PUT attempt is not included in this count. Default: 12.
+    pub put_no_space_max_retries: Option<u32>,
+    /// Initial retry backoff after NO_AVAILABLE_HANDLE, in milliseconds.
+    /// Retries use jittered exponential backoff. Default: 100 ms.
+    pub put_no_space_retry_initial_backoff_ms: Option<u64>,
+    /// Maximum base retry backoff after NO_AVAILABLE_HANDLE, in milliseconds.
+    /// Default: 2000 ms.
+    pub put_no_space_retry_max_backoff_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
