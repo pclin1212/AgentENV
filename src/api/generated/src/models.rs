@@ -184,6 +184,18 @@ pub struct V2SandboxesGetQueryParams {
     #[serde(rename = "state")]
     #[serde(default)]
     pub state: Vec<models::SandboxState>,
+    /// Sort direction by sandbox start time. Defaults to desc (newest first).
+    #[serde(rename = "order")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order: Option<models::OrderDirection>,
+    /// Return sandboxes started at or after this timestamp.
+    #[serde(rename = "startedAfter")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_after: Option<chrono::DateTime<chrono::Utc>>,
+    /// Filter sandboxes by a template ID or alias.
+    #[serde(rename = "template")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
     /// Cursor to start the list from
     #[serde(rename = "nextToken")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3567,11 +3579,6 @@ pub struct NodeDetail {
     #[validate(nested)]
     pub metrics: models::NodeMetrics,
 
-    /// List of cached builds id on the node
-    #[serde(rename = "cachedBuilds")]
-    #[validate(custom(function = "check_xss_vec_string"))]
-    pub cached_builds: Vec<String>,
-
     /// Number of sandbox create successes
     #[serde(rename = "createSuccesses")]
     pub create_successes: u64,
@@ -3597,7 +3604,6 @@ impl NodeDetail {
         status: models::NodeStatus,
         sandbox_count: u32,
         metrics: models::NodeMetrics,
-        cached_builds: Vec<String>,
         create_successes: u64,
         create_fails: u64,
         sandbox_paused_count: u32,
@@ -3612,7 +3618,6 @@ impl NodeDetail {
             status,
             sandbox_count,
             metrics,
-            cached_builds,
             create_successes,
             create_fails,
             sandbox_paused_count,
@@ -3642,14 +3647,6 @@ impl std::fmt::Display for NodeDetail {
             Some("sandboxCount".to_string()),
             Some(self.sandbox_count.to_string()),
             // Skipping metrics in query parameter serialization
-            Some("cachedBuilds".to_string()),
-            Some(
-                self.cached_builds
-                    .iter()
-                    .map(|x| x.to_string())
-                    .collect::<Vec<_>>()
-                    .join(","),
-            ),
             Some("createSuccesses".to_string()),
             Some(self.create_successes.to_string()),
             Some("createFails".to_string()),
@@ -3686,7 +3683,6 @@ impl std::str::FromStr for NodeDetail {
             pub status: Vec<models::NodeStatus>,
             pub sandbox_count: Vec<u32>,
             pub metrics: Vec<models::NodeMetrics>,
-            pub cached_builds: Vec<Vec<String>>,
             pub create_successes: Vec<u64>,
             pub create_fails: Vec<u64>,
             pub sandbox_paused_count: Vec<u32>,
@@ -3750,12 +3746,6 @@ impl std::str::FromStr for NodeDetail {
                         <models::NodeMetrics as std::str::FromStr>::from_str(val)
                             .map_err(|x| x.to_string())?,
                     ),
-                    "cachedBuilds" => {
-                        return std::result::Result::Err(
-                            "Parsing a container in this style is not supported in NodeDetail"
-                                .to_string(),
-                        );
-                    }
                     #[allow(clippy::redundant_clone)]
                     "createSuccesses" => intermediate_rep.create_successes.push(
                         <u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
@@ -3827,11 +3817,6 @@ impl std::str::FromStr for NodeDetail {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "metrics missing in NodeDetail".to_string())?,
-            cached_builds: intermediate_rep
-                .cached_builds
-                .into_iter()
-                .next()
-                .ok_or_else(|| "cachedBuilds missing in NodeDetail".to_string())?,
             create_successes: intermediate_rep
                 .create_successes
                 .into_iter()
@@ -4228,6 +4213,50 @@ impl std::str::FromStr for NodeStatus {
             "draining" => std::result::Result::Ok(NodeStatus::NodeStatusDraining),
             "connecting" => std::result::Result::Ok(NodeStatus::NodeStatusConnecting),
             "unhealthy" => std::result::Result::Ok(NodeStatus::NodeStatusUnhealthy),
+            _ => std::result::Result::Err(format!(r#"Value not valid: {s}"#)),
+        }
+    }
+}
+
+/// Sort direction
+/// Enumeration of values.
+/// Since this enum's variants do not hold data, we can easily define them as `#[repr(C)]`
+/// which helps with FFI.
+#[allow(non_camel_case_types, clippy::large_enum_variant)]
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[cfg_attr(feature = "conversion", derive(frunk_enum_derive::LabelledGenericEnum))]
+pub enum OrderDirection {
+    #[serde(rename = "asc")]
+    Asc,
+    #[serde(rename = "desc")]
+    Desc,
+}
+
+impl validator::Validate for OrderDirection {
+    fn validate(&self) -> std::result::Result<(), validator::ValidationErrors> {
+        std::result::Result::Ok(())
+    }
+}
+
+impl std::fmt::Display for OrderDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            OrderDirection::Asc => write!(f, "asc"),
+            OrderDirection::Desc => write!(f, "desc"),
+        }
+    }
+}
+
+impl std::str::FromStr for OrderDirection {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "asc" => std::result::Result::Ok(OrderDirection::Asc),
+            "desc" => std::result::Result::Ok(OrderDirection::Desc),
             _ => std::result::Result::Err(format!(r#"Value not valid: {s}"#)),
         }
     }

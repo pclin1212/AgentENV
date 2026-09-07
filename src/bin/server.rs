@@ -86,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
     let identity = NodeIdentity::from_config(&config.node_identity);
     let p2p_transport = agentenv::p2p::transport_from_config(config, &identity).await?;
     let p2p_local_endpoint = p2p_transport.local_endpoint();
+    agentenv::image::initialize_image_cache_p2p_transport(Arc::clone(&p2p_transport));
     let overlaybd_p2p =
         OverlaybdP2pRuntime::start_from_app_config(config, Arc::clone(&p2p_transport)).await;
 

@@ -24,6 +24,21 @@ use uuid::Uuid;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Upload shape for [`ImageService::export_upper_as_oss_sealed`].
+///
+/// Sized for the ceiling rather than for memory, because this entry point is
+/// library surface: it can be handed an image of any size, and the part size is
+/// what bounds how large that may be. S3 allows 10,000 parts, so 64 MiB caps a
+/// single object at ~625 GiB, where 16 MiB would cap it at 156 GiB — and
+/// exceeding the cap is not caught up front, it fails partway through the upload.
+///
+/// The price is memory: peak is `(2 * concurrency + 2) * part_size`, so ~640 MiB
+/// here. Concurrency stays at 4 to keep that from doubling; past the point where
+/// it covers the round-trip time, more parts in flight buy little. See
+/// `backend::oss::upload_file_streaming` for both derivations.
+const OSS_SEALED_UPLOAD_PART_SIZE: usize = 64 * 1024 * 1024;
+const OSS_SEALED_UPLOAD_CONCURRENCY: usize = 4;
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum RemoteOpenMode {
     Direct,
@@ -238,6 +253,22 @@ impl ImageService {
 
     pub fn global_config(&self) -> &GlobalConfig {
         &self.inner.global_config
+    }
+
+    /// The object-store backend, or `None` when `ossConfig.enable` is false.
+    ///
+    /// Exposed so a caller that needs object storage for its own purposes — reading
+    /// a metadata object, uploading a sealed layer — shares this one instead of
+    /// constructing a second `OssBackend` from the same `ossConfig`. A second one
+    /// would work, but it would carry its own operator cache and its own resolved
+    /// credentials, and a `credentialProcess` costs a subprocess per cache miss.
+    /// `OssBackend` is `Arc`-backed, so a clone of the returned value shares both.
+    ///
+    /// **This initializes the whole remote runtime**, including the registry client
+    /// and the file cache, because they share one `OnceCell` with the backend. A
+    /// caller serving only local images should check `ossConfig.enable` and not ask.
+    pub async fn oss_backend(&self) -> Result<Option<&OssBackend>> {
+        Ok(self.remote_runtime().await?.oss_backend.as_ref())
     }
 
     pub fn io_engine(&self) -> u32 {
@@ -543,7 +574,15 @@ impl ImageService {
         }
 
         stage_file.sync().await?;
-        let upload_result = oss.upload_path(dest_url, &stage_path).await;
+        let upload_result = oss
+            .upload_path(
+                dest_url,
+                &stage_path,
+                OSS_SEALED_UPLOAD_PART_SIZE,
+                OSS_SEALED_UPLOAD_CONCURRENCY,
+                None,
+            )
+            .await;
         // Always clean up the staging file regardless of upload outcome.
         // The staging file is a full copy of the sealed upper layer and can
         // be large; leaving it on disk across failures would accumulate waste.
