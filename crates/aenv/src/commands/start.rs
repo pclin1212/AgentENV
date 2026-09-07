@@ -10,9 +10,7 @@ const ENVD_READY_PROBE_INTERVAL: Duration = Duration::from_millis(100);
 #[derive(ClapArgs)]
 #[command(after_help = "Examples:
   aenv start my-template
-  aenv start --node node-1 my-template
   aenv start --cold docker.io/library/ubuntu:24.04
-  aenv start --node node-1 --cold docker.io/library/ubuntu:24.04
   aenv start --cold docker.io/library/ubuntu:24.04 --cpu 2 --mem 2048 --disk-size-mb 8192
   aenv start --cold -d docker.io/library/ubuntu:24.04
 
@@ -20,9 +18,6 @@ Resource overrides are only supported with --cold.")]
 pub struct Args {
     /// Template ID, snapshot alias, or external image reference when --cold is set
     target: String,
-    /// Create the sandbox on this scheduler node ID through the configured gateway.
-    #[arg(long, value_name = "NODE_ID")]
-    node: Option<String>,
     /// Start directly from an external OCI image instead of a template/snapshot
     #[arg(long)]
     cold: bool,
@@ -54,12 +49,8 @@ fn parse_disk_size_mb(value: &str) -> std::result::Result<u32, String> {
 
 pub fn run(args: Args) -> Result<()> {
     let client = Client::from_env()?;
-    let create_client = match args.node.as_deref() {
-        Some(node_id) => client.with_target_node_id(node_id)?,
-        None => client.clone(),
-    };
     let sandbox = if args.cold {
-        create_client.create_cold_sandbox(
+        client.create_cold_sandbox(
             &args.target,
             Some(args.timeout),
             args.resources.cpu_count,
@@ -71,7 +62,7 @@ pub fn run(args: Args) -> Result<()> {
         if args.resources.is_set() || args.disk_size_mb.is_some() {
             anyhow::bail!("--cpu-count, --memory-mb, and --disk-size-mb require --cold");
         }
-        create_client.create_sandbox(&args.target, Some(args.timeout), args.secure)?
+        client.create_sandbox(&args.target, Some(args.timeout), args.secure)?
     };
     let sandbox_id = sandbox.sandbox_id;
 
