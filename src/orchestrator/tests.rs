@@ -815,6 +815,7 @@ fn create_launch_plan_with_resources(sandbox_id: SandboxId) -> LaunchPlan {
         SandboxLaunchConfig::default(),
         transitional_metadata,
         NewTimeout::Set(Duration::from_secs(15)),
+        false,
     )
 }
 
@@ -1170,7 +1171,57 @@ fn create_request(
         custom_extension_params: None,
         auto_resume: false,
         secure: false,
+        sandbox_id: None,
+        start_paused: false,
     }
+}
+
+#[tokio::test]
+async fn create_sandbox_honors_explicit_sandbox_id() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let sandbox_id = SandboxId::new();
+    let mut request = create_request(Some(60), &[]);
+    request.sandbox_id = Some(sandbox_id);
+
+    let created = orchestrator.create_sandbox(request).await?;
+
+    assert_eq!(created.id, sandbox_id);
+    assert_eq!(created.state, SandboxState::Running);
+    assert_proxy_ready(&orchestrator, &sandbox_id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_sandbox_start_paused_keeps_resumable_state() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    let sandbox_id = SandboxId::new();
+    let mut request = create_request(Some(60), &[]);
+    request.sandbox_id = Some(sandbox_id);
+    request.start_paused = true;
+
+    let created = orchestrator.create_sandbox(request).await?;
+
+    assert_eq!(created.id, sandbox_id);
+    assert_eq!(created.state, SandboxState::Paused);
+    assert!(created.paused_state.is_some());
+    assert_eq!(behavior.stop_calls(), 1);
+    assert!(!orchestrator
+        .sandboxes
+        .read()
+        .await
+        .contains_key(&sandbox_id));
+
+    let resumed = orchestrator
+        .resume_sandbox(sandbox_id, NewTimeout::None)
+        .await?;
+    assert_eq!(resumed.state, SandboxState::Running);
+    assert_proxy_ready(&orchestrator, &sandbox_id).await?;
+    Ok(())
 }
 
 fn write_local_commit_image_config(path: &Path, file: &Path, digest: &str, size: u64) {
@@ -1232,6 +1283,8 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
             custom_extension_params: None,
             auto_resume: false,
             secure: false,
+            sandbox_id: None,
+            start_paused: false,
         })
         .await?;
 

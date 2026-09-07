@@ -861,8 +861,8 @@ mod tests {
     use super::{
         bundled_manifest, ensure_firecracker, ensure_kernel, ensure_tools, file_exists_nonempty,
         overlaybd_credential_fields, overlaybd_runtime_mc_config, overlaybd_runtime_oss_config,
-        validate_explicit_file,
-        version_output_mentions_exact_token, write_generated_overlaybd_global_configs,
+        validate_explicit_file, version_output_mentions_exact_token,
+        write_generated_overlaybd_global_configs,
     };
     use overlaybd::config::{load_global_config, DownloadConfig};
 

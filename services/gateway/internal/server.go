@@ -166,6 +166,16 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, value any) {
 }
 
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
+	// Migrate is a control-plane orchestration API handled entirely in the
+	// gateway: it must not be proxied to the source node. Detect it before
+	// any host/header routing so the request body is still intact for the
+	// orchestrator to read the target node id.
+	if isMigrateRequest(r) {
+		setGatewayRouteSource(w, routeSourcePath)
+		s.handleMigrate(w, r)
+		return
+	}
+
 	websocket := isWebSocketRequest(r)
 	streaming := isStreamingRequest(r)
 	longLived := streaming || websocket
@@ -604,7 +614,7 @@ func isSandboxControlPlaneRequest(r *http.Request) bool {
 	}
 
 	switch parts[2] {
-	case "pause", "resume", "fork", "connect", "timeout", "refreshes", "snapshots":
+	case "pause", "resume", "fork", "connect", "timeout", "refreshes", "snapshots", "migrate":
 		return r.Method == http.MethodPost
 	case "network":
 		return r.Method == http.MethodPut
@@ -866,6 +876,20 @@ func (s *Server) isSandboxDataPlaneRequest(r *http.Request) bool {
 
 func isExplicitProxyPath(path string) bool {
 	return path == "/proxy" || strings.HasPrefix(path, "/proxy/")
+}
+
+// isMigrateRequest reports whether r is a POST /sandboxes/{sandboxID}/migrate
+// control-plane call. The migrate endpoint is orchestrated by the gateway
+// itself rather than being proxied to a backend node.
+func isMigrateRequest(r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) != 3 || parts[0] != "sandboxes" || strings.TrimSpace(parts[1]) == "" {
+		return false
+	}
+	return parts[2] == "migrate"
 }
 
 func (s *Server) authenticate(next http.Handler) http.Handler {

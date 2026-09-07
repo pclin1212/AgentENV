@@ -36,6 +36,16 @@ pub struct CreateSandboxRequest {
     pub secure: bool,
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     pub custom_extension_params: Option<CustomExtensionParams>,
+    /// Optional explicit sandbox identifier. When set, the runtime uses this
+    /// ID verbatim instead of generating a new UUIDv7. Used by the gateway
+    /// migrate flow to preserve the source sandbox's ID on the target node.
+    /// None means "generate a fresh UUIDv7".
+    pub sandbox_id: Option<crate::types::SandboxId>,
+    /// When true, the sandbox is launched directly into the `Paused` state
+    /// instead of `Running`. Used by the migrate-paused flow so a sandbox
+    /// migrated from a paused source remains paused on the target node.
+    /// Default is `false` (the legacy behavior: launch into Running).
+    pub start_paused: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

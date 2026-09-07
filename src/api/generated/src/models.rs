@@ -2879,6 +2879,16 @@ pub struct NewSandbox {
     #[validate(custom(function = "check_xss_string"))]
     pub template_id: String,
 
+    /// Optional explicit sandbox identifier. When set, the runtime uses this ID verbatim instead of generating a new UUIDv7. Used by the gateway migrate flow to preserve the source sandbox's ID on the target node. The runtime rejects the request with 409 if a sandbox with the given ID already exists on this node.
+    #[serde(rename = "sandboxID")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_id: Option<String>,
+
+    /// When true, the sandbox is launched directly into the Paused state instead of Running. Used by the gateway migrate-paused flow so a sandbox migrated from a paused source remains paused on the target node.
+    #[serde(rename = "startPaused")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_paused: Option<bool>,
+
     /// Time to live for the sandbox in seconds.
     #[serde(rename = "timeout")]
     #[validate(range(min = 0u32))]
@@ -2939,6 +2949,8 @@ impl NewSandbox {
     pub fn new(template_id: String) -> NewSandbox {
         NewSandbox {
             template_id,
+            sandbox_id: None,
+            start_paused: None,
             timeout: Some(15),
             auto_pause: Some(true),
             auto_resume: None,
@@ -3013,6 +3025,7 @@ impl std::str::FromStr for NewSandbox {
         #[allow(dead_code)]
         struct IntermediateRep {
             pub template_id: Vec<String>,
+            pub sandbox_id: Vec<String>,
             pub timeout: Vec<u32>,
             pub auto_pause: Vec<bool>,
             pub auto_resume: Vec<models::SandboxAutoResumeConfig>,
@@ -3024,6 +3037,7 @@ impl std::str::FromStr for NewSandbox {
             pub custom_extension_params:
                 Vec<std::collections::HashMap<String, crate::types::Object>>,
             pub mcp: Vec<std::collections::HashMap<String, crate::types::Object>>,
+            pub start_paused: Vec<bool>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -3050,6 +3064,10 @@ impl std::str::FromStr for NewSandbox {
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
                     #[allow(clippy::redundant_clone)]
+                    "sandboxID" => intermediate_rep.sandbox_id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
                     "timeout" => intermediate_rep.timeout.push(
                         <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
@@ -3068,6 +3086,10 @@ impl std::str::FromStr for NewSandbox {
                     ),
                     #[allow(clippy::redundant_clone)]
                     "allow_internet_access" => intermediate_rep.allow_internet_access.push(
+                        <bool as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "startPaused" => intermediate_rep.start_paused.push(
                         <bool as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
                     #[allow(clippy::redundant_clone)]
@@ -3118,6 +3140,7 @@ impl std::str::FromStr for NewSandbox {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "templateID missing in NewSandbox".to_string())?,
+            sandbox_id: intermediate_rep.sandbox_id.into_iter().next(),
             timeout: intermediate_rep.timeout.into_iter().next(),
             auto_pause: intermediate_rep.auto_pause.into_iter().next(),
             auto_resume: intermediate_rep.auto_resume.into_iter().next(),
@@ -3130,6 +3153,7 @@ impl std::str::FromStr for NewSandbox {
             mcp: std::result::Result::Err(
                 "Nullable types not supported in NewSandbox".to_string(),
             )?,
+            start_paused: intermediate_rep.start_paused.into_iter().next(),
         })
     }
 }

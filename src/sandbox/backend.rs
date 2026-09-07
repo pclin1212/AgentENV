@@ -39,6 +39,21 @@ pub trait PausedSandboxState: Any + fmt::Debug + Send + Sync + 'static {
     fn control_plane_port(&self) -> Option<u16> {
         None
     }
+
+    /// Build a [`CapturedSandboxSnapshot`] directly from this persisted paused
+    /// state, without spawning or resuming a live sandbox backend.
+    ///
+    /// Backends that already wrote snapshot artifacts during `pause` can
+    /// implement this to publish those artifacts as a snapshot, which is
+    /// required for migrating a paused sandbox. Backends that cannot produce
+    /// a captured snapshot without a live process return `Err`.
+    fn create_captured_snapshot(
+        &self,
+    ) -> std::result::Result<CapturedSandboxSnapshot, anyhow::Error> {
+        Err(anyhow::anyhow!(
+            "backend does not support capturing a snapshot from a persisted paused state"
+        ))
+    }
 }
 
 impl dyn PausedSandboxState {

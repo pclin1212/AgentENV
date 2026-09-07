@@ -541,6 +541,23 @@ components:
             Identifier of the required template/snapshot. Use
             POST /sandboxes-cold to create a sandbox directly from an external
             OCI image.
+        sandboxID:
+          type: string
+          format: uuid
+          description: >
+            Optional explicit sandbox identifier. When set, the runtime uses
+            this ID verbatim instead of generating a new UUIDv7. Used by the
+            gateway migrate flow to preserve the source sandbox's ID on the
+            target node. The runtime rejects the request with 409 if a
+            sandbox with the given ID already exists on this node.
+        startPaused:
+          type: boolean
+          default: false
+          description: >
+            When true, the sandbox is launched directly into the Paused
+            state instead of Running. Used by the gateway migrate-paused
+            flow so a sandbox migrated from a paused source remains paused
+            on the target node.
         timeout:
           type: integer
           format: int32

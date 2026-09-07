@@ -14,6 +14,10 @@ pub(super) struct CreateLaunchPlan {
     pub launch_config: SandboxLaunchConfig,
     pub metadata: SandboxMetadata,
     pub timeout: NewTimeout,
+    /// When true, the sandbox is launched directly into the `Paused` state
+    /// instead of `Running`. Used by the migrate-paused flow so the target
+    /// sandbox remains paused after migration.
+    pub start_paused: bool,
 }
 
 pub(super) enum CreateLaunchSource {
@@ -45,6 +49,7 @@ impl LaunchPlan {
         launch_config: SandboxLaunchConfig,
         metadata: SandboxMetadata,
         timeout: NewTimeout,
+        start_paused: bool,
     ) -> Self {
         Self::Create(Box::new(CreateLaunchPlan {
             sandbox_id,
@@ -52,6 +57,7 @@ impl LaunchPlan {
             launch_config,
             metadata,
             timeout,
+            start_paused,
         }))
     }
 
@@ -61,6 +67,7 @@ impl LaunchPlan {
         launch_config: SandboxLaunchConfig,
         metadata: SandboxMetadata,
         timeout: NewTimeout,
+        start_paused: bool,
     ) -> Self {
         Self::Create(Box::new(CreateLaunchPlan {
             sandbox_id,
@@ -70,6 +77,7 @@ impl LaunchPlan {
             launch_config,
             metadata,
             timeout,
+            start_paused,
         }))
     }
 

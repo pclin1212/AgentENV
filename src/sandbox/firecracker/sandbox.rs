@@ -202,7 +202,7 @@ pub struct FirecrackerSandbox {
 #[derive(Debug)]
 pub struct FirecrackerCapturedSnapshot {
     manifest: FirecrackerSnapshotManifest,
-    _snapshot_root: Arc<PersistentSnapshotRootGuard>,
+    _snapshot_root: Option<Arc<PersistentSnapshotRootGuard>>,
 }
 
 #[derive(Clone, Debug)]
@@ -244,6 +244,35 @@ impl PausedSandboxState for FirecrackerPausedState {
             &self.snapshot_config.common,
         ))
     }
+
+    fn create_captured_snapshot(
+        &self,
+    ) -> std::result::Result<CapturedSandboxSnapshot, anyhow::Error> {
+        let cfg = &self.snapshot_config;
+        let rootfs_image_config = cfg
+            .common
+            .rootfs_image_config
+            .as_ref()
+            .context("paused state missing rootfs_image_config")?;
+        let rootfs_virtual_size = cfg
+            .common
+            .rootfs_virtual_size
+            .context("paused state missing rootfs_virtual_size")?;
+
+        let manifest = FirecrackerSnapshotManifest::new(
+            cfg.vm_state_path.clone(),
+            cfg.mem_overlaybd_config.image_config_path.clone(),
+            cfg.mem_virtual_size,
+            rootfs_image_config.image_config_path.clone(),
+            rootfs_virtual_size,
+            &cfg.common.extra_drives,
+        )
+        .context("build manifest from persisted paused state")?;
+
+        Ok(CapturedSandboxSnapshot::new(
+            FirecrackerCapturedSnapshot::from_persisted(manifest),
+        ))
+    }
 }
 
 impl FirecrackerCapturedSnapshot {
@@ -253,7 +282,14 @@ impl FirecrackerCapturedSnapshot {
     ) -> Self {
         Self {
             manifest,
-            _snapshot_root: snapshot_root,
+            _snapshot_root: Some(snapshot_root),
+        }
+    }
+
+    fn from_persisted(manifest: FirecrackerSnapshotManifest) -> Self {
+        Self {
+            manifest,
+            _snapshot_root: None,
         }
     }
 
