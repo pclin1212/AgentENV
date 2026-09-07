@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0b68ea43.js";
+            window.path_to_searchindex_js = "../searchindex-3ec94f5d.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-5437f69c.js"></script>
+        <script src="../toc-a02e686b.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -495,6 +495,18 @@ egress destinations regardless of <code>always_denied_cidrs</code>.</p>
 </div>
 <p>The managed seed is node-local persistent state and must be included in backups of <code>$AENV_HOME</code>. AgentENV refuses to generate a replacement when persisted secure or private-ingress sandboxes exist. An explicit environment or TOML value takes precedence over the managed file; changing that effective value invalidates existing sandbox access tokens.</p>
 <p>Configure <code>AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED</code> with the same value on every runtime node in a clustered deployment. Standalone runtime nodes use their managed seed when it is unset.</p>
+<h2 id="volume"><a class="header" href="#volume"><code>[volume]</code></a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>max_size_mb</code></td><td>integer</td><td><code>262144</code></td><td>Maximum persistent volume size in MiB (256 GiB).</td></tr>
+<tr><td><code>max_volume_count</code></td><td>integer</td><td><code>4</code></td><td>Maximum number of persistent volumes that one sandbox may mount. Must be between 1 and the Firecracker extra-drive limit.</td></tr>
+</tbody>
+</table>
+</div>
 <h2 id="orchestrator"><a class="header" href="#orchestrator"><code>[orchestrator]</code></a></h2>
 <p>Sandbox lifecycle management.</p>
 <div class="table-wrapper">
@@ -856,12 +868,30 @@ and are then re-fetched on demand.</p>
 </tbody>
 </table>
 </div>
+<h2 id="template_build"><a class="header" href="#template_build"><code>[template_build]</code></a></h2>
+<p>Compression settings applied when a template build captures its snapshot.
+This section is fully independent of <code>[memory_snapshot].compression_enabled</code>:
+template builds consult only these keys, for both memory layers and the
+sealed rootfs read-write layer. Pause/snapshot captures of running sandboxes
+are not affected, and rootfs seals stay raw there.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>compression_enabled</code></td><td>bool</td><td><code>false</code></td><td>Enable compression for snapshot artifacts captured by template builds. When enabled, both the memory layers and the sealed rootfs read-write layer are written as ZFile-compressed layers.</td></tr>
+<tr><td><code>compression_algorithm</code></td><td>string</td><td><code>"lz4"</code></td><td>Compression algorithm. Valid values are only <code>lz4</code> and <code>zstd</code>. Parsed but ignored when compression is disabled.</td></tr>
+<tr><td><code>compression_workers</code></td><td>integer</td><td><code>1</code></td><td>Number of blocking threads used to compress 4 KiB blocks within a layer. <code>1</code> is sequential; higher values run in parallel without changing the output layout. Clamped to 64.</td></tr>
+</tbody>
+</table>
+</div>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../deployment/pvm.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../troubleshooting/common-issues.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
@@ -875,7 +905,7 @@ and are then re-fetched on demand.</p>
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../deployment/pvm.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../troubleshooting/common-issues.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
