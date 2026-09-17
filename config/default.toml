@@ -260,6 +260,7 @@ p2p_enabled = true
 # device_name = ""                         # required only by transports that need a device
 # preferred_segments = ["nvme-target-1"]  # optional allocation affinity
 # max_object_size = 4194304                # split larger artifacts into 4 MiB objects
+# chunk_upload_concurrency = 4              # in-flight chunks per managed layer
 
 [ublk]
 # Explicit daemon executable. The default is under $AENV_HOME/ublk.

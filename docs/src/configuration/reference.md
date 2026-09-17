@@ -465,6 +465,8 @@ locations into OverlayBD image metadata.
 | `device_name` | string | empty | RDMA/UB device name when required by the selected protocol |
 | `preferred_segments` | array of strings | empty | Optional Mooncake allocation-affinity segment names |
 | `max_object_size` | integer | `4194304` | Direct-object/chunk threshold in bytes. Larger artifacts are split into objects of this size; `0` disables AgentENV-side chunking |
+| `local_buffer_size` | integer | `134217728` | Per-client Mooncake transfer staging budget in bytes, shared by concurrent repository writes through cloned client handles. It must be at least `max_object_size` |
+| `chunk_upload_concurrency` | integer | `4` | Maximum in-flight chunks per managed layer. AgentENV reads the next chunk while earlier chunks upload; all layers also share `local_buffer_size` admission control |
 
 The Rust FFI mirrors Mooncake's published `mooncake_replicate_config_t` ABI and
 does not add a `nof_replica_num` field. For a NoF-only write policy, set these

@@ -8,9 +8,15 @@ approximation for the user-facing snapshot-create API from existing stage logs.
 
 Comparable metrics:
 
-* Mooncake: ``read_ms + upload_ms`` from
-  ``snapshot publish layer processed`` events where ``uploaded=true``.
+* Mooncake: ``transfer_pipeline_ms`` from ``snapshot publish layer processed``
+  events where ``uploaded=true``. On older logs without that field, the script
+  falls back to ``read_ms + upload_ms``.
 * OSS/S3: ``elapsed_ms`` from ``oss file uploaded`` events for managed layers.
+
+For pipelined Mooncake uploads, ``read_ms`` and ``upload_ms`` remain an
+additive compatibility breakdown of the wall clock. ``upload_work_ms`` is the
+cumulative PUT worker time; it overlaps with reads and other PUT workers and
+must not be added. ``transfer_pipeline_ms`` is authoritative wall-clock time.
 
 Mooncake's metric ends when the client PUT completes. If Mooncake later
 offloads a memory replica to SSD, that asynchronous/offload time is not part of
@@ -65,6 +71,8 @@ class UploadRecord:
     digest: str = ""
     read_ms: float = 0.0
     upload_ms: float = 0.0
+    transfer_pipeline_ms: float = 0.0
+    pipelined: bool = False
     snapshot_api: bool = False
 
 
@@ -168,7 +176,12 @@ def parse_upload_line(
 
         artifact = str(fields.get("layer_group", "unknown"))
         read_ms = parse_float(fields.get("read_ms"))
-        upload_ms = parse_float(fields.get("upload_ms"))
+        legacy_upload_ms = parse_float(fields.get("upload_ms"))
+        upload_ms = parse_float(fields.get("upload_work_ms"), legacy_upload_ms)
+        pipelined = "transfer_pipeline_ms" in fields
+        transfer_pipeline_ms = parse_float(
+            fields.get("transfer_pipeline_ms"), read_ms + legacy_upload_ms
+        )
         layer_index = (
             parse_int(fields["layer_index"])
             if "layer_index" in fields
@@ -178,9 +191,11 @@ def parse_upload_line(
             backend="mooncake",
             artifact=artifact,
             size_bytes=parse_int(fields.get("size_bytes")),
-            remote_ms=read_ms + upload_ms,
+            remote_ms=transfer_pipeline_ms,
             read_ms=read_ms,
             upload_ms=upload_ms,
+            transfer_pipeline_ms=transfer_pipeline_ms,
+            pipelined=pipelined,
             source_file=source_file,
             line_number=line_number,
             snapshot_id=str(fields.get("snapshot_id", "")),
@@ -593,7 +608,7 @@ def render_records(records: Iterable[UploadRecord]) -> None:
     print("\nPer-upload records:")
     print(
         f"{'BACKEND':<10} {'ARTIFACT':<16} {'SIZE':>12} {'REMOTE':>10} "
-        f"{'READ':>9} {'UPLOAD':>9} {'SNAPSHOT':<20} {'LAYER':>6}"
+        f"{'READ':>9} {'PUT-WORK':>9} {'SNAPSHOT':<20} {'LAYER':>6}"
     )
     print("-" * 110)
     for record in records:
@@ -671,7 +686,9 @@ def main() -> int:
     if args.json:
         payload: dict[str, object] = {
             "metric_definition": {
-                "mooncake": "read_ms + upload_ms",
+                "mooncake": (
+                    "transfer_pipeline_ms (legacy fallback: read_ms + upload_ms)"
+                ),
                 "s3": "oss file uploaded elapsed_ms",
                 "estimated_end_to_end": "capture_total + publish_total",
                 "scope": "user-facing snapshot create API only",
@@ -684,7 +701,14 @@ def main() -> int:
             payload["uploads"] = [asdict(record) for record in records]
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
-        print("Metric: Mooncake=read_ms+upload_ms; S3=oss upload elapsed_ms")
+        print(
+            "Metric: Mooncake=transfer_pipeline_ms "
+            "(legacy fallback: read_ms+upload_ms); S3=oss upload elapsed_ms"
+        )
+        print(
+            "Mooncake pipelined logs: READ and PUT-WORK may overlap; "
+            "REMOTE is the wall-clock transfer time."
+        )
         print("Scope: user-facing snapshot create API only (pull/pause publish excluded)")
         print("Note: Mooncake asynchronous SSD offload completion is not included.\n")
         if summaries:

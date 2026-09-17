@@ -1011,17 +1011,15 @@ impl MoonCakeSnapshotRepository {
         let existence_check_ms = existence_check_start.elapsed().as_millis() as u64;
         let mut read_ms = 0;
         let mut upload_ms = 0;
+        let mut upload_work_ms = 0;
+        let mut transfer_pipeline_ms = 0;
+        let mut upload_chunk_count = 0;
+        let mut upload_concurrency = 0;
         let mut uploaded = false;
         if !exists {
-            let read_start = Instant::now();
-            let data = tokio::fs::read(source).await.map_err(|e| {
-                RepositoryError::backend(format!("read managed layer '{}'", source.display()), e)
-            })?;
-            read_ms = read_start.elapsed().as_millis() as u64;
-            let upload_start = Instant::now();
-            uploaded = self
+            let stats = self
                 .client
-                .put_chunked_immutable(key, data)
+                .put_chunked_file_immutable(key, source, descriptor.size)
                 .await
                 .map_err(|e| {
                     RepositoryError::backend(
@@ -1029,7 +1027,17 @@ impl MoonCakeSnapshotRepository {
                         e,
                     )
                 })?;
-            upload_ms = upload_start.elapsed().as_millis() as u64;
+            uploaded = stats.published;
+            read_ms = stats.read_ms;
+            upload_work_ms = stats.upload_work_ms;
+            transfer_pipeline_ms = stats.pipeline_ms;
+            // Keep the legacy read_ms + upload_ms relationship equal to the
+            // transfer wall clock for existing analyzers. Actual cumulative
+            // PUT worker time is reported separately because it overlaps with
+            // both reading and other concurrent chunk PUTs.
+            upload_ms = transfer_pipeline_ms.saturating_sub(read_ms);
+            upload_chunk_count = stats.chunk_count;
+            upload_concurrency = stats.concurrency;
             debug!(
                 digest = %descriptor.sha256,
                 "uploaded managed layer to mooncake"
@@ -1053,6 +1061,11 @@ impl MoonCakeSnapshotRepository {
             existence_check_ms,
             read_ms,
             upload_ms,
+            upload_work_ms,
+            transfer_pipeline_ms,
+            upload_chunk_count,
+            upload_concurrency,
+            timings_overlap = !exists && upload_concurrency > 1,
             elapsed_ms = layer_start.elapsed().as_millis() as u64,
             "snapshot publish layer processed"
         );

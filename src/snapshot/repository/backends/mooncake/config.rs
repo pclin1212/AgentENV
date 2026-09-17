@@ -34,6 +34,9 @@ pub(crate) const DEFAULT_MAX_OBJECT_SIZE: u32 = 4 * 1024 * 1024; // 4 MiB
 /// Default total transfer staging buffer owned by each MoonCake client.
 pub(crate) const DEFAULT_LOCAL_BUFFER_SIZE: u64 = 128 * 1024 * 1024; // 128 MiB
 
+/// Default number of chunks from one object uploaded concurrently.
+pub(crate) const DEFAULT_CHUNK_UPLOAD_CONCURRENCY: usize = 4;
+
 /// Default retry budget for a PUT rejected while MoonCake is reclaiming space.
 pub(crate) const DEFAULT_PUT_NO_SPACE_MAX_RETRIES: u32 = 12;
 
@@ -59,6 +62,10 @@ pub(crate) struct NormalizedMoonCakeConfig {
     /// Total client-side transfer staging buffer. Concurrent operations share
     /// this pool, so it must not be coupled to the per-object chunk size.
     pub local_buffer_size: u64,
+    /// Maximum number of chunks from one object that may be in flight. Layer
+    /// files are streamed through this bounded window instead of being loaded
+    /// entirely into memory before upload.
+    pub chunk_upload_concurrency: usize,
     /// Number of retries after the initial PUT receives NO_AVAILABLE_HANDLE.
     pub put_no_space_max_retries: u32,
     /// Initial retry backoff in milliseconds.
@@ -77,6 +84,9 @@ impl NormalizedMoonCakeConfig {
         let local_buffer_size = config
             .local_buffer_size
             .unwrap_or(DEFAULT_LOCAL_BUFFER_SIZE);
+        let chunk_upload_concurrency = config
+            .chunk_upload_concurrency
+            .unwrap_or(DEFAULT_CHUNK_UPLOAD_CONCURRENCY);
         let put_no_space_max_retries = config
             .put_no_space_max_retries
             .unwrap_or(DEFAULT_PUT_NO_SPACE_MAX_RETRIES);
@@ -95,6 +105,10 @@ impl NormalizedMoonCakeConfig {
             max_object_size == 0 || local_buffer_size >= u64::from(max_object_size),
             "backend.mooncake.local_buffer_size ({local_buffer_size}) must be at least \
              max_object_size ({max_object_size})"
+        );
+        ensure!(
+            chunk_upload_concurrency > 0,
+            "backend.mooncake.chunk_upload_concurrency must be greater than zero"
         );
         ensure!(
             put_no_space_max_retries == 0 || put_no_space_retry_initial_backoff_ms > 0,
@@ -120,6 +134,7 @@ impl NormalizedMoonCakeConfig {
             preferred_segments: config.preferred_segments.clone().unwrap_or_default(),
             max_object_size,
             local_buffer_size,
+            chunk_upload_concurrency,
             put_no_space_max_retries,
             put_no_space_retry_initial_backoff_ms,
             put_no_space_retry_max_backoff_ms,
@@ -157,6 +172,7 @@ mod tests {
             preferred_segments: None,
             max_object_size: None,
             local_buffer_size: None,
+            chunk_upload_concurrency: None,
             put_no_space_max_retries: None,
             put_no_space_retry_initial_backoff_ms: None,
             put_no_space_retry_max_backoff_ms: None,
@@ -169,6 +185,10 @@ mod tests {
 
         assert_eq!(normalized.max_object_size, DEFAULT_MAX_OBJECT_SIZE);
         assert_eq!(normalized.local_buffer_size, DEFAULT_LOCAL_BUFFER_SIZE);
+        assert_eq!(
+            normalized.chunk_upload_concurrency,
+            DEFAULT_CHUNK_UPLOAD_CONCURRENCY
+        );
         assert_eq!(
             normalized.put_no_space_max_retries,
             DEFAULT_PUT_NO_SPACE_MAX_RETRIES
@@ -188,10 +208,12 @@ mod tests {
         let mut config = config();
         config.max_object_size = Some(8 * 1024 * 1024);
         config.local_buffer_size = Some(256 * 1024 * 1024);
+        config.chunk_upload_concurrency = Some(8);
 
         let normalized = NormalizedMoonCakeConfig::new(&config).expect("normalize config");
         assert_eq!(normalized.max_object_size, 8 * 1024 * 1024);
         assert_eq!(normalized.local_buffer_size, 256 * 1024 * 1024);
+        assert_eq!(normalized.chunk_upload_concurrency, 8);
     }
 
     #[test]
@@ -204,6 +226,17 @@ mod tests {
         assert!(error
             .to_string()
             .contains("must be at least max_object_size"));
+    }
+
+    #[test]
+    fn rejects_zero_chunk_upload_concurrency() {
+        let mut config = config();
+        config.chunk_upload_concurrency = Some(0);
+
+        let error = NormalizedMoonCakeConfig::new(&config).expect_err("invalid config");
+        assert!(error
+            .to_string()
+            .contains("chunk_upload_concurrency must be greater than zero"));
     }
 
     #[test]

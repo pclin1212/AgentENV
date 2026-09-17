@@ -403,6 +403,10 @@ pub struct MoonCakeBackendConfig {
     /// Total MoonCake client transfer buffer size in bytes. This is independent
     /// from `max_object_size`, which only controls object chunking. Default 128 MiB.
     pub local_buffer_size: Option<u64>,
+    /// Maximum number of chunks from one object uploaded concurrently. Layer
+    /// files are read incrementally while earlier chunks are in flight, so
+    /// this also bounds the per-layer read-ahead memory. Default: 4.
+    pub chunk_upload_concurrency: Option<usize>,
     /// Number of retries after MoonCake returns NO_AVAILABLE_HANDLE (-200).
     /// The initial PUT attempt is not included in this count. Default: 12.
     pub put_no_space_max_retries: Option<u32>,
