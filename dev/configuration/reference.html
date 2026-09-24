@@ -28,7 +28,7 @@
         <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
-        <link rel="stylesheet" href="../theme/version-selector-d91336b6.css">
+        <link rel="stylesheet" href="../theme/version-selector-6d0145d1.css">
 
 
         <!-- Provide site root and default themes to javascript -->
@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3ec94f5d.js";
+            window.path_to_searchindex_js = "../searchindex-e14be1b7.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-a02e686b.js"></script>
+        <script src="../toc-d7504e7d.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -229,8 +229,8 @@ local path overrides, not the default dependency catalog.</p>
 <tr><td><code>socket_timeout_secs</code></td><td>integer</td><td><code>3</code></td><td>Max seconds to wait for the Firecracker API socket</td></tr>
 <tr><td><code>socket_poll_ms</code></td><td>integer</td><td><code>1</code></td><td>Poll interval (ms) for checking socket availability</td></tr>
 <tr><td><code>work_dir</code></td><td>string</td><td><code>"$AENV_HOME/firecracker-work"</code></td><td>Parent directory for per-sandbox Firecracker work directories. These dirs contain runtime sockets, symlinks, local logs, and writable OverlayBD upper layer data such as <code>overlaybd/upper.data</code> and <code>overlaybd/upper.index</code></td></tr>
-<tr><td><code>serial_dir</code></td><td>string</td><td><code>"$AENV_HOME/logs/serial"</code></td><td>Directory for persistent Firecracker serial output (per-sandbox subdirectories)</td></tr>
-<tr><td><code>log_level</code></td><td>string</td><td>unset (disabled)</td><td>Optional Firecracker log level (<code>Error</code>, <code>Warning</code>, <code>Info</code>, <code>Debug</code>, <code>Trace</code>, case-insensitive). When set to a non-empty value, Firecracker’s own logging is enabled and written to a <code>firecracker.log</code> file in each sandbox’s log directory (alongside the serial output). Empty/unset disables it</td></tr>
+<tr><td><code>serial_dir</code></td><td>string</td><td><code>"$AENV_HOME/logs/serial"</code></td><td>Directory for persistent Firecracker logs when enabled (per-sandbox subdirectories). Setting this path alone does not enable logging</td></tr>
+<tr><td><code>log_level</code></td><td>string</td><td>unset (disabled)</td><td>Optional Firecracker log level (<code>Error</code>, <code>Warning</code>, <code>Info</code>, <code>Debug</code>, <code>Trace</code>, case-insensitive). A non-empty value enables <code>firecracker.log</code> and stdout/stderr capture in each sandbox’s log directory. Empty/unset discards stdout/stderr and creates no log files or per-sandbox log directories. Explicit Rust stdout/stderr destinations still enable the requested stream</td></tr>
 </tbody>
 </table>
 </div>
@@ -249,7 +249,8 @@ local path overrides, not the default dependency catalog.</p>
 </table>
 </div>
 <h2 id="tools"><a class="header" href="#tools"><code>[tools]</code></a></h2>
-<p>Tools drive image used to boot the AgentENV control plane inside each microVM.</p>
+<p>Tools drive image used to boot the AgentENV control plane inside each microVM.
+The default release is selected automatically; most deployments can leave this section unchanged.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -263,11 +264,20 @@ local path overrides, not the default dependency catalog.</p>
 </tbody>
 </table>
 </div>
-<p>Snapshots and paused sandboxes keep using the tools drive version they were
-created with. Launch does not download missing releases: operators must install
-the recorded version under <code>&lt;deps_path&gt;/tools/&lt;version&gt;/tools.ext4</code> before
-restore. Setup retains previously installed versions until they are removed
-manually.</p>
+<p>Snapshots and paused sandboxes record only <code>tools_drive_version</code>. Launch and
+restore fetch that version from the configured URL template when it is missing
+locally. Releases must be immutable and retained for the lifetime of their
+snapshots; changing the default version affects new sandboxes and templates.</p>
+<p>OCI tools rootfs images carry <code>io.agentenv.tools-drive.format=oci-rootfs-v1</code>
+(the tools Dockerfile adds it automatically). They are downloaded and converted
+locally with a stable, pinned conversion contract. Converted layers live in the
+versioned dependency directory, independently of image-cache eviction. Explicit
+<code>--setup-only</code> prepares the default release for dependency bundles.</p>
+<p>Native OverlayBD images keep lazy reads and automatically download tools layers
+in the background after envd is ready, independently of memory and user disks.
+Legacy images without the format label provide <code>tools.ext4</code>, which is downloaded
+and mounted read-only. Tools are not uploaded into snapshot storage. A local
+<code>drive_path</code> only identifies its declared version.</p>
 <h2 id="template-rootfs-images"><a class="header" href="#template-rootfs-images">Template Rootfs Images</a></h2>
 <p>User-visible rootfs images are selected at the template API layer.
 <code>POST /v2/templates/{templateID}/builds/{buildID}</code> accepts an optional
@@ -516,6 +526,8 @@ egress destinations regardless of <code>always_denied_cidrs</code>.</p>
 </thead>
 <tbody>
 <tr><td><code>auto_evict_interval_ms</code></td><td>integer</td><td><code>1000</code></td><td>Poll interval (ms) for background timeout eviction</td></tr>
+<tr><td><code>metrics_interval_secs</code></td><td>integer</td><td><code>15</code></td><td>Guest metrics scan interval; 0 disables collection</td></tr>
+<tr><td><code>metrics_retention_secs</code></td><td>integer</td><td><code>3600</code></td><td>Node-local in-memory guest sample retention (seconds)</td></tr>
 <tr><td><code>default_sandbox_timeout_secs</code></td><td>integer</td><td><code>15</code></td><td>Default keep-alive timeout for sandboxes</td></tr>
 <tr><td><code>auto_resume_min_sandbox_timeout_secs</code></td><td>integer</td><td><code>300</code></td><td>When a data-plane request targets a non-running sandbox, automatically resume it (if auto-resume is enabled) and refresh its timeout for no-less than this duration</td></tr>
 <tr><td><code>persisted_sandbox_store_path</code></td><td>string</td><td><code>"$AENV_HOME/persisted-sandboxes"</code></td><td>Directory for persisted sandbox state</td></tr>
@@ -642,7 +654,7 @@ snapshot publication/runtime resolution as an optional acceleration path.</p>
 </table>
 </div>
 <h2 id="custom_extension"><a class="header" href="#custom_extension"><code>[custom_extension]</code></a></h2>
-<p>Custom extension service configuration. When <code>url</code> is unset, the integration is fully disabled. See <a href="../concepts/custom-extension.html">Custom Extension</a>.</p>
+<p>Custom extension service configuration. When <code>url</code> is unset, the integration is fully disabled. See <a href="../concepts/custom-extension/index.html">Custom Extension</a>.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -684,6 +696,31 @@ snapshot publication/runtime resolution as an optional acceleration path.</p>
 </tbody>
 </table>
 </div>
+<h2 id="snapshotpublish_compression"><a class="header" href="#snapshotpublish_compression"><code>[snapshot.publish_compression]</code></a></h2>
+<p>Publish-time compression for snapshot layers uploaded to OSS/ACR. Local layers
+always stay raw, so local resume pays no decompression cost; enabled by default,
+memory layers and incremental read-write layers are compressed once as they
+are uploaded, cutting network bytes for cross-node resume. This is the only
+compression switch; the legacy capture-time knobs under <code>[memory_snapshot]</code>
+and <code>[template_build]</code> were removed from the configuration schema.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>boolean</td><td><code>true</code></td><td>Compress memory layers and incremental read-write layers when uploading them to OSS/ACR.</td></tr>
+<tr><td><code>algorithm</code></td><td>string</td><td><code>"lz4"</code></td><td>Compression algorithm. Valid values are only <code>lz4</code> and <code>zstd</code>.</td></tr>
+<tr><td><code>workers</code></td><td>integer</td><td><code>1</code></td><td>Number of blocking threads used to compress 4 KiB blocks within a layer. <code>1</code> is sequential; higher values run in parallel without changing the output layout. Clamped to 64.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Known impact: compressed layers are recorded without a layer uuid (ZFile
+layers carry no LSMT uuid), so P2P uuid-keyed acceleration does not apply to
+them. Snapshot P2P publication also skips digest-keyed advertisements for
+local raw layers whose digest is absent from the committed record — the
+record names the compressed bytes, so the raw digest key would never be
+looked up by consumers.</p>
 <h2 id="backendposix_fs"><a class="header" href="#backendposix_fs"><code>[backend.posix_fs]</code></a></h2>
 <p>POSIX filesystem-backed snapshot repository configuration. This section is used when <code>snapshot.repository_backend = "posix_fs"</code>.</p>
 <div class="table-wrapper">
@@ -820,8 +857,6 @@ the default path on every startup.</p>
 <tbody>
 <tr><td><code>overlaybd_global_config_path</code></td><td>string</td><td><code>"$AENV_HOME/overlaybd/mem-overlaybd-global.json"</code></td><td>Path to the overlaybd global config used for the memory-snapshot ublk backend. Regenerated at startup (manual edits are overwritten); change only to relocate the generated file.</td></tr>
 <tr><td><code>track_dirty_pages</code></td><td>bool</td><td><code>true</code></td><td>Enable Firecracker KVM dirty-page tracking for memory snapshots. PVM automatically disables it because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set <code>AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false</code> to disable it.</td></tr>
-<tr><td><code>compression_enabled</code></td><td>bool</td><td><code>false</code></td><td>Enable compression for memory snapshot layers. When disabled, <code>compression_algorithm</code> is still parsed but has no effect. This setting affects only memory layers; the physical file name remains <code>overlaybd.commit</code>.</td></tr>
-<tr><td><code>compression_algorithm</code></td><td>string</td><td><code>"lz4"</code></td><td>Compression algorithm for memory snapshot layers. Valid values are only <code>lz4</code> and <code>zstd</code>.</td></tr>
 </tbody>
 </table>
 </div>
@@ -869,20 +904,23 @@ and are then re-fetched on demand.</p>
 </table>
 </div>
 <h2 id="template_build"><a class="header" href="#template_build"><code>[template_build]</code></a></h2>
-<p>Compression settings applied when a template build captures its snapshot.
-This section is fully independent of <code>[memory_snapshot].compression_enabled</code>:
-template builds consult only these keys, for both memory layers and the
-sealed rootfs read-write layer. Pause/snapshot captures of running sandboxes
-are not affected, and rootfs seals stay raw there.</p>
+<p>Managed Dockerfile builder resources. The first Dockerfile
+build on a node prepares a reusable internal builder template. Each build mounts
+a separate clone of the repository’s shared cache seed; concurrent builds do not
+queue for cache ownership. The last successfully published cache becomes the next
+seed, with best-effort reuse of concurrent branches.
+Builder resources do not change the resulting template’s CPU or memory.</p>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>compression_enabled</code></td><td>bool</td><td><code>false</code></td><td>Enable compression for snapshot artifacts captured by template builds. When enabled, both the memory layers and the sealed rootfs read-write layer are written as ZFile-compressed layers.</td></tr>
-<tr><td><code>compression_algorithm</code></td><td>string</td><td><code>"lz4"</code></td><td>Compression algorithm. Valid values are only <code>lz4</code> and <code>zstd</code>. Parsed but ignored when compression is disabled.</td></tr>
-<tr><td><code>compression_workers</code></td><td>integer</td><td><code>1</code></td><td>Number of blocking threads used to compress 4 KiB blocks within a layer. <code>1</code> is sequential; higher values run in parallel without changing the output layout. Clamped to 64.</td></tr>
+<tr><td><code>max_concurrent_builds</code></td><td>integer</td><td><code>4</code></td><td>Per-node limit for managed builds, including preparation, publication, and cleanup. Must be greater than zero. Excess builder PUT requests return HTTP 429 and leave the build waiting for retry.</td></tr>
+<tr><td><code>builder_image</code></td><td>string</td><td><code>"docker.io/moby/buildkit:v0.33.0"</code></td><td>Image containing the managed BuildKit daemon, client, and OCI runtime.</td></tr>
+<tr><td><code>builder_cpu_count</code></td><td>integer</td><td><code>16</code></td><td>Builder vCPUs, from 1 to 255.</td></tr>
+<tr><td><code>builder_memory_mb</code></td><td>integer</td><td><code>32768</code></td><td>Builder memory in MiB, from 256 to 2147483647.</td></tr>
+<tr><td><code>cache_size_mb</code></td><td>integer</td><td><code>65536</code></td><td>Capacity in MiB for new persistent BuildKit data disks. At least 1024 and at most <code>volume.max_size_mb</code>; changing it does not resize existing caches.</td></tr>
 </tbody>
 </table>
 </div>

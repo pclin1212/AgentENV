@@ -67,12 +67,6 @@ components:
       required: true
       schema:
         type: string
-    accessTokenID:
-      name: accessTokenID
-      in: path
-      required: true
-      schema:
-        type: string
     snapshotID:
       name: snapshotID
       in: path
@@ -103,6 +97,12 @@ components:
       in: query
       description: Cursor to start the list from
       required: false
+      schema:
+        type: string
+    volumeID:
+      name: volumeID
+      in: path
+      required: true
       schema:
         type: string
 
@@ -244,68 +244,6 @@ components:
       additionalProperties:
         type: string
         description: Environment variables for the sandbox
-
-    Volume:
-      type: object
-      required:
-        - volumeID
-        - name
-        - sizeMB
-        - status
-      properties:
-        volumeID:
-          type: string
-          description: Stable identifier of the volume.
-        name:
-          type: string
-          pattern: "^[a-zA-Z0-9_-]+$"
-          description: Unique human-readable volume name.
-        mode:
-          type: string
-          description: Access mode (`ro` or `exclusive`).
-        sizeMB:
-          type: integer
-          format: int64
-          minimum: 1
-          description: Effective volume size in MiB.
-        status:
-          type: string
-          description: Availability state (`ready`, `uploading`, or `failed`).
-
-    NewVolume:
-      type: object
-      required:
-        - name
-      properties:
-        name:
-          type: string
-          pattern: "^[a-zA-Z0-9_-]+$"
-          description: Unique volume name.
-        sizeMB:
-          type: integer
-          format: int64
-          minimum: 1
-          default: 65536
-          description: Volume size in MiB. Defaults to 65536 MiB (64 GiB).
-        mode:
-          type: string
-          description: Access mode (`ro` or `exclusive`).
-        fromVolume:
-          type: string
-          description: >-
-            Existing volume ID or name to use as a COW source. An exclusive
-            source must not be mounted by a sandbox; sandbox fork snapshots
-            and publishes its owned volumes internally before creating child
-            volumes.
-        image:
-          type: string
-          description: OCI or OverlayBD image reference for the initial content.
-
-    VolumeMounts:
-      type: object
-      description: Map of absolute guest mount paths to volume IDs or names.
-      additionalProperties:
-        type: string
 
     AttachedDriveSource:
       type: object
@@ -450,6 +388,71 @@ components:
           description: Whether the sandbox can auto-resume.
         onTimeout:
           $ref: "#/components/schemas/SandboxOnTimeout"
+
+    SandboxMetric:
+      description: Metric entry with timestamp and line
+      required:
+        - timestamp
+        - timestampUnix
+        - cpuCount
+        - cpuUsedPct
+        - memUsed
+        - memTotal
+        - memCache
+        - diskUsed
+        - diskTotal
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+          deprecated: true
+          description: Timestamp of the metric entry
+        timestampUnix:
+          type: integer
+          format: int64
+          description: Timestamp of the metric entry in Unix time (seconds since epoch)
+        cpuCount:
+          type: integer
+          format: int32
+          description: Number of CPU cores
+        cpuUsedPct:
+          type: number
+          format: float
+          description: CPU usage percentage
+        memUsed:
+          type: integer
+          format: int64
+          description: Memory used in bytes
+        memTotal:
+          type: integer
+          format: int64
+          description: Total memory in bytes
+        memCache:
+          type: integer
+          format: int64
+          description: Cached memory (page cache) in bytes
+        diskUsed:
+          type: integer
+          format: int64
+          description: Disk used in bytes
+        diskTotal:
+          type: integer
+          format: int64
+          description: Total disk space in bytes
+
+    SandboxVolumeMount:
+      type: object
+      properties:
+        name:
+          type: string
+          description: Name of the volume
+        path:
+          type: string
+          description: Path of the volume
+      required:
+        - name
+        - path
+
     Sandbox:
       required:
         - templateID
@@ -546,7 +549,9 @@ components:
         lifecycle:
           $ref: "#/components/schemas/SandboxLifecycle"
         volumeMounts:
-          $ref: "#/components/schemas/VolumeMounts"
+          type: array
+          items:
+            $ref: "#/components/schemas/SandboxVolumeMount"
 
     ListedSandbox:
       required:
@@ -595,7 +600,17 @@ components:
         envdVersion:
           $ref: "#/components/schemas/EnvdVersion"
         volumeMounts:
-          $ref: "#/components/schemas/VolumeMounts"
+          type: array
+          items:
+            $ref: "#/components/schemas/SandboxVolumeMount"
+
+    SandboxesWithMetrics:
+      required:
+        - sandboxes
+      properties:
+        sandboxes:
+          additionalProperties:
+            $ref: "#/components/schemas/SandboxMetric"
 
     NewSandbox:
       required:
@@ -638,7 +653,51 @@ components:
         mcp:
           $ref: "#/components/schemas/Mcp"
         volumeMounts:
-          $ref: "#/components/schemas/VolumeMounts"
+          type: array
+          items:
+            $ref: "#/components/schemas/SandboxVolumeMount"
+
+    NewSandboxV2:
+      description: >-
+        Sandbox creation request. All system communication with the sandbox is
+        always secured; the template's envd version must support secured access.
+      required:
+        - templateID
+      properties:
+        templateID:
+          type: string
+          description: Identifier of the required template
+        timeout:
+          type: integer
+          format: int32
+          minimum: 1
+          default: 300
+          description: Time to live for the sandbox in seconds.
+        autoPause:
+          type: boolean
+          default: true
+          description: Automatically pauses the sandbox after the timeout
+        autoResume:
+          $ref: "#/components/schemas/SandboxAutoResumeConfig"
+        allow_internet_access:
+          type: boolean
+          description:
+            Allow sandbox to access the internet. When set to false, it behaves the same as specifying denyOut
+            to 0.0.0.0/0 in the network config.
+        network:
+          $ref: "#/components/schemas/SandboxNetworkConfig"
+        metadata:
+          $ref: "#/components/schemas/SandboxMetadata"
+        envVars:
+          $ref: "#/components/schemas/EnvVars"
+        customExtensionParams:
+          $ref: "#/components/schemas/CustomExtensionParams"
+        mcp:
+          $ref: "#/components/schemas/Mcp"
+        volumeMounts:
+          type: array
+          items:
+            $ref: "#/components/schemas/SandboxVolumeMount"
 
     ResumedSandbox:
       properties:
@@ -688,7 +747,9 @@ components:
         customExtensionParams:
           $ref: "#/components/schemas/CustomExtensionParams"
         volumeMounts:
-          $ref: "#/components/schemas/VolumeMounts"
+          type: array
+          items:
+            $ref: "#/components/schemas/SandboxVolumeMount"
         cpuCount:
           allOf:
             - $ref: "#/components/schemas/CPUCount"
@@ -717,6 +778,16 @@ components:
           type: integer
           format: int32
           minimum: 0
+
+    ConnectSandboxV2:
+      type: object
+      properties:
+        timeout:
+          description: Timeout in seconds from the current time after which the sandbox should expire
+          type: integer
+          format: int32
+          minimum: 1
+          default: 300
 
     SandboxTimeoutRequest:
       type: object
@@ -1010,6 +1081,30 @@ components:
           $ref: "#/components/schemas/CPUCount"
         memoryMB:
           $ref: "#/components/schemas/MemoryMB"
+
+    TemplateBuilderRequest:
+      type: object
+      properties:
+        startCmd:
+          type: string
+          description: Override the final image ENTRYPOINT/CMD for template startup. Omit to use the image command; an empty string disables startup.
+        readyCmd:
+          type: string
+          description: Override the final image HEALTHCHECK before snapshot capture.
+        timeout:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 86400
+          description: Builder preparation and Dockerfile build deadline in seconds; defaults to 3600.
+
+    TemplateBuilder:
+      type: object
+      required: [imageName]
+      properties:
+        imageName:
+          type: string
+          description: Required BuildKit image exporter name for this build. The server observes its successful completion and automatically imports and publishes the template.
 
     TemplateBuildStartV2:
       type: object
@@ -1358,6 +1453,62 @@ components:
           type: string
           description: Error
 
+    Volume:
+      type: object
+      properties:
+        volumeID:
+          type: string
+          description: ID of the volume
+        name:
+          type: string
+          description: Name of the volume
+        mode:
+          type: string
+          description: Access mode (`ro` or `exclusive`).
+        sizeMB:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Effective volume size in MiB.
+        status:
+          type: string
+          description: Availability state (`ready`, `uploading`, or `failed`).
+      required:
+        - volumeID
+        - name
+        - mode
+        - sizeMB
+        - status
+
+    NewVolume:
+      type: object
+      properties:
+        name:
+          type: string
+          description: Name of the volume
+          pattern: "^[a-zA-Z0-9_-]+$"
+        sizeMB:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 65536
+          description: Volume size in MiB. Defaults to 65536 MiB (64 GiB).
+        mode:
+          type: string
+          description: Access mode (`ro` or `exclusive`).
+        fromVolume:
+          type: string
+          description: >-
+            Existing volume ID or name to use as a COW source. An exclusive
+            source must not be mounted by a sandbox; sandbox fork snapshots
+            and publishes its owned volumes internally before creating child
+            volumes.
+        image:
+          type: string
+          description: OCI or OverlayBD image reference for the initial content.
+      required:
+        - name
+
 tags:
   - name: admin
   - name: templates
@@ -1376,125 +1527,10 @@ paths:
         "401":
           $ref: "#/components/responses/401"
 
-  /volumes:
-    get:
-      summary: List volumes
-      description: List independently managed persistent volumes.
-      tags: [volumes]
-      security:
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
-      parameters:
-        - $ref: "#/components/parameters/paginationNextToken"
-        - $ref: "#/components/parameters/paginationLimit"
-      responses:
-        "200":
-          description: Volumes returned successfully
-          headers:
-            X-Next-Token:
-              $ref: "#/components/headers/XNextToken"
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  $ref: "#/components/schemas/Volume"
-        "401":
-          $ref: "#/components/responses/401"
-        "400":
-          $ref: "#/components/responses/400"
-        "500":
-          $ref: "#/components/responses/500"
-    post:
-      summary: Create a volume
-      description: Create an empty, image-backed, or copy-on-write volume.
-      tags: [volumes]
-      security:
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/NewVolume"
-      responses:
-        "201":
-          description: Volume created successfully
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Volume"
-        "400":
-          $ref: "#/components/responses/400"
-        "409":
-          $ref: "#/components/responses/409"
-        "500":
-          $ref: "#/components/responses/500"
-
-  /volumes/{volumeID}:
-    get:
-      summary: Get a volume
-      description: Get a volume by ID or unique name.
-      tags: [volumes]
-      security:
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
-      parameters:
-        - name: volumeID
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        "200":
-          description: Volume returned successfully
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Volume"
-        "404":
-          $ref: "#/components/responses/404"
-        "500":
-          $ref: "#/components/responses/500"
-    delete:
-      summary: Delete a volume
-      description: Delete a volume catalog entry when it is not reserved.
-      tags: [volumes]
-      security:
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
-      parameters:
-        - name: volumeID
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        "204":
-          description: Volume deleted successfully
-        "404":
-          $ref: "#/components/responses/404"
-        "409":
-          $ref: "#/components/responses/409"
-        "500":
-          $ref: "#/components/responses/500"
-
   /sandboxes:
     get:
       summary: List running sandboxes
+      x-api-group: list
       description: List all running sandboxes. Use GET /v2/sandboxes instead.
       deprecated: true
       tags: [sandboxes]
@@ -1529,9 +1565,10 @@ paths:
     post:
       summary: Create sandbox
       description: >
-        Create a sandbox from an existing template/snapshot. Use
+        Create a sandbox from an existing template/snapshot. Use POST /v2/sandboxes instead or
         POST /sandboxes-cold to create a sandbox directly from an external OCI
         image.
+      deprecated: true
       tags: [sandboxes]
       security:
         - ApiKeyAuth: []
@@ -1607,9 +1644,117 @@ paths:
         "500":
           $ref: "#/components/responses/500"
 
+  /templates/{templateID}/builds/{buildID}/builder:
+    description: Build a template from a Dockerfile
+    parameters:
+      - name: templateID
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: buildID
+        in: path
+        required: true
+        schema:
+          type: string
+    put:
+      summary: Prepare the BuildKit worker for a template build
+      description: Start a BuildKit worker for the template build
+      tags: [templates]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TemplateBuilderRequest"
+      responses:
+        "202":
+          description: Builder preparation accepted
+          headers:
+            x-agentenv-build-id:
+              description: Build identifier used by the gateway for routing.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateBuilder"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+        "429":
+          description: Concurrent build limit reached
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/500"
+    delete:
+      summary: Cancel a template build and release its worker
+      description: Cancel the build and release its BuildKit worker
+      tags: [templates]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "204":
+          description: Builder released
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"
+
   /v2/sandboxes:
+    post:
+      summary: Create sandbox (v2)
+      description: Create a sandbox from the template. All system communication with the sandbox is secured.
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewSandboxV2"
+      responses:
+        "201":
+          description: The sandbox was created successfully
+          headers:
+            x-agentenv-sandbox-id:
+              description: Identifier of the created sandbox for proxy routing.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Sandbox"
+        "401":
+          $ref: "#/components/responses/401"
+        "400":
+          $ref: "#/components/responses/400"
+        "409":
+          $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"
     get:
       summary: List sandboxes (v2)
+      x-api-group: list
       description: List all sandboxes
       tags: [sandboxes]
       security:
@@ -1677,6 +1822,40 @@ paths:
         "500":
           $ref: "#/components/responses/500"
 
+  /sandboxes/metrics:
+    get:
+      summary: List sandbox metrics
+      x-api-group: list
+      description: Latest fresh samples for requested running sandboxes. Missing, paused, or unavailable sandboxes are omitted.
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: sandbox_ids
+          in: query
+          required: true
+          description: Comma-separated sandbox IDs.
+          explode: false
+          schema:
+            type: array
+            maxItems: 100
+            uniqueItems: true
+            items:
+              type: string
+      responses:
+        '200':
+          description: Successfully returned all running sandboxes with metrics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SandboxesWithMetrics'
+        '400':
+          $ref: '#/components/responses/400'
+        '401':
+          $ref: '#/components/responses/401'
+        '500':
+          $ref: '#/components/responses/500'
+
   /sandboxes/{sandboxID}:
     get:
       summary: Sandbox
@@ -1725,6 +1904,47 @@ paths:
           $ref: "#/components/responses/401"
         "500":
           $ref: "#/components/responses/500"
+
+  /sandboxes/{sandboxID}/metrics:
+    get:
+      summary: Sandbox metrics
+      description: Samples in the inclusive start/end interval, in ascending time order. Defaults to all retained samples. History is node-local, bounded, and lost on restart.
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/sandboxID'
+        - name: start
+          in: query
+          description: Unix timestamp in seconds, inclusive.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+        - name: end
+          in: query
+          description: Unix timestamp in seconds, inclusive.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+      responses:
+        '200':
+          description: Successfully returned the sandbox metrics
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SandboxMetric'
+        '400':
+          $ref: '#/components/responses/400'
+        '401':
+          $ref: '#/components/responses/401'
+        '404':
+          $ref: '#/components/responses/404'
+        '500':
+          $ref: '#/components/responses/500'
 
   # TODO: Pause and resume might be exposed as POST /sandboxes/{sandboxID}/snapshot and then POST /sandboxes with specified snapshotting setup
   /sandboxes/{sandboxID}/pause:
@@ -1841,7 +2061,8 @@ paths:
   /sandboxes/{sandboxID}/connect:
     post:
       summary: Connect sandbox
-      description: Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended.
+      description: Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended. Use POST /v2/sandboxes/{sandboxID}/connect instead.
+      deprecated: true
       tags: [sandboxes]
       security:
         - ApiKeyAuth: []
@@ -1857,6 +2078,52 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/ConnectSandbox"
+      responses:
+        "200":
+          description: The sandbox was already running
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Sandbox"
+        "201":
+          description: The sandbox was resumed successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Sandbox"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /v2/sandboxes/{sandboxID}/connect:
+    post:
+      summary: Connect sandbox (v2)
+      description: >-
+        Returns sandbox details. If the sandbox is paused, it will be resumed.
+        TTL is only extended. The request body is optional; an omitted timeout
+        defaults to 300 seconds.
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConnectSandboxV2"
       responses:
         "200":
           description: The sandbox was already running
@@ -2083,6 +2350,7 @@ paths:
   /snapshots:
     get:
       summary: List snapshots
+      x-api-group: list
       description: List all snapshots for the team
       tags: [snapshots]
       security:
@@ -2131,7 +2399,6 @@ paths:
       tags: [snapshots]
       security:
         - ApiKeyAuth: []
-        - AccessTokenAuth: []
         - AuthProviderBearerAuth: []
           AuthProviderTeamAuth: []
         - AdminApiKeyAuth: []
@@ -2187,11 +2454,11 @@ paths:
   /v2/templates:
     get:
       summary: List templates (v2)
+      x-api-group: list
       description: List all templates
       tags: [templates]
       security:
         - ApiKeyAuth: []
-        - AccessTokenAuth: []
         - AuthProviderBearerAuth: []
           AuthProviderTeamAuth: []
         - AdminApiKeyAuth: []
@@ -2229,12 +2496,12 @@ paths:
   /templates:
     get:
       summary: List templates
+      x-api-group: list
       description: List all templates
       deprecated: true
       tags: [templates]
       security:
         - ApiKeyAuth: []
-        - AccessTokenAuth: []
         - AuthProviderBearerAuth: []
           AuthProviderTeamAuth: []
         - AdminApiKeyAuth: []
@@ -2263,6 +2530,7 @@ paths:
   /templates/{templateID}:
     get:
       summary: List template builds
+      x-api-group: list
       description: List all builds for a template
       tags: [templates]
       security:
@@ -2297,7 +2565,6 @@ paths:
       tags: [templates]
       security:
         - ApiKeyAuth: []
-        - AccessTokenAuth: []
         - AuthProviderBearerAuth: []
           AuthProviderTeamAuth: []
         - AdminApiKeyAuth: []
@@ -2309,6 +2576,8 @@ paths:
           description: The template was deleted successfully
         "401":
           $ref: "#/components/responses/401"
+        "409":
+          $ref: "#/components/responses/409"
         "500":
           $ref: "#/components/responses/500"
 
@@ -2350,7 +2619,6 @@ paths:
       description: Get template build info
       tags: [templates]
       security:
-        - AccessTokenAuth: []
         - ApiKeyAuth: []
         - AuthProviderBearerAuth: []
           AuthProviderTeamAuth: []
@@ -2465,5 +2733,122 @@ paths:
           $ref: "#/components/responses/401"
         "404":
           $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /volumes:
+    get:
+      summary: List team volumes
+      x-api-group: list
+      description: List team volumes
+      tags: [volumes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/paginationNextToken"
+        - $ref: "#/components/parameters/paginationLimit"
+      responses:
+        "200":
+          description: Successfully listed team volumes
+          headers:
+            X-Next-Token:
+              $ref: "#/components/headers/XNextToken"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Volume"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "500":
+          $ref: "#/components/responses/500"
+
+    post:
+      summary: Create team volume
+      description: Create a new team volume
+      tags: [volumes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewVolume"
+      responses:
+        "201":
+          description: Successfully created a new team volume
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Volume"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "409":
+          $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /volumes/{volumeID}:
+    get:
+      summary: Team volume
+      description: Get team volume info
+      tags: [volumes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/volumeID"
+      responses:
+        "200":
+          description: Successfully retrieved a team volume
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Volume"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
+
+    delete:
+      summary: Delete team volume
+      description: Delete a team volume
+      tags: [volumes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/volumeID"
+      responses:
+        "204":
+          description: Successfully deleted a team volume
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
         "500":
           $ref: "#/components/responses/500"
