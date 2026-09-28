@@ -1,8 +1,9 @@
+use std::ffi::CString;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
 use firecracker_client::models::drive::IoEngine;
@@ -18,12 +19,12 @@ use hyper::Method;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use serde_json::value::RawValue;
-use tokio::process::{Child, Command};
 use tokio::time::{self, Duration, Instant};
 use tracing::{debug, trace, warn};
 
 use super::mmds::MmdsMetadata;
 use super::socket::UnixSocketClient;
+use crate::privileges::{ScopedChild, ScopedSpawnSpec};
 
 /// Maximum size (in bytes) of the MMDS data store. The Firecracker default is
 /// 51200 (50 KiB); we raise it to 1 MiB to accommodate raw image configs
@@ -31,12 +32,55 @@ use super::socket::UnixSocketClient;
 const MMDS_SIZE_LIMIT: usize = 1_048_576;
 const HTTP_API_MAX_PAYLOAD_SIZE: usize = MMDS_SIZE_LIMIT;
 
+/// Firecracker interface id of the sandbox network device, and the persistent
+/// TAP interface backing it inside the sandbox network namespace.
+pub(crate) const SANDBOX_NET_IFACE_ID: &str = "eth0";
+pub(crate) const SANDBOX_TAP_IFACE_NAME: &str = "tap0";
+
+/// Descriptor number the pre-opened TAP queue is parked on for the child. The
+/// first slot after the standard streams; the child only consumes descriptors
+/// it is told about, so replacing an inherited one here is safe.
+const NET_TAP_FD: RawFd = 3;
+
+/// Hands Firecracker the sandbox TAP queue as a pre-opened, pre-configured
+/// descriptor (an `fdp:` `host_dev_name` spec) instead of letting it open the
+/// interface by name inside the sandbox network namespace.
+///
+/// The handoff borrows the queue descriptor it hands over: the spawn dups
+/// the raw number through a child-private file action, so the descriptor
+/// must stay open until the spawn call returns. The borrow makes dropping
+/// the owning queue — and with it the slot — before the spawn a compile
+/// error instead of a runtime hazard.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TapHandoff<'a> {
+    queue_fd: RawFd,
+    _queue: &'a OwnedFd,
+}
+
+impl<'a> TapHandoff<'a> {
+    /// Wraps a queue descriptor the caller keeps open across the spawn.
+    pub(crate) fn new(queue: &'a OwnedFd) -> Self {
+        Self {
+            queue_fd: queue.as_raw_fd(),
+            _queue: queue,
+        }
+    }
+
+    /// The `host_dev_name` value that hands Firecracker the pre-opened queue.
+    /// The `fdp:` spec tells Firecracker the queue's vnet header size is
+    /// already preset (`FC_VNET_HDR_LEN` in the slot attach), so it skips its
+    /// validation and TUNSETVNETHDRSZ configuration ioctls.
+    pub(crate) fn host_dev_name(&self) -> String {
+        format!("fdp:{NET_TAP_FD}:{SANDBOX_TAP_IFACE_NAME}")
+    }
+}
+
 pub(crate) struct FirecrackerInstance {
     client: UnixSocketClient,
     work_dir: PathBuf,
     socket_path: PathBuf,
     stderr_path: Option<PathBuf>,
-    process: Option<Child>,
+    process: Option<ScopedChild>,
 }
 
 impl FirecrackerInstance {
@@ -55,7 +99,7 @@ impl FirecrackerInstance {
         let raw_pid = self
             .process
             .as_ref()
-            .and_then(|child| child.id())
+            .map(|child| child.id())
             .context("firecracker process is not running")?;
         let raw_pid = i32::try_from(raw_pid).context("firecracker pid does not fit in i32")?;
         Ok(Pid::from_raw(raw_pid))
@@ -67,6 +111,7 @@ impl FirecrackerInstance {
         stdout_path: Option<&Path>,
         stderr_path: Option<&Path>,
         netns: Option<&Path>,
+        tap: Option<TapHandoff<'_>>,
     ) -> Result<()> {
         if self.process.is_some() {
             bail!("firecracker process already started");
@@ -82,6 +127,7 @@ impl FirecrackerInstance {
             binary = %firecracker_binary.display(),
             socket_path = %self.socket_path.display(),
             netns = ?netns,
+            tap = ?tap,
             "spawning firecracker process"
         );
 
@@ -96,49 +142,56 @@ impl FirecrackerInstance {
             })
             .transpose()?;
 
-        let mut cmd = Command::new(&firecracker_binary);
-        cmd.process_group(0);
-
-        cmd.arg("--api-sock")
-            .arg(&self.socket_path)
-            .arg("--mmds-size-limit")
-            .arg(MMDS_SIZE_LIMIT.to_string())
-            .arg("--http-api-max-payload-size")
-            .arg(HTTP_API_MAX_PAYLOAD_SIZE.to_string())
-            .stdin(Stdio::null());
-
-        // Set Current Working Directory to the workspace
-        // This is crucial for relative paths to work
-        cmd.current_dir(&self.work_dir);
+        let fd_handoff = match tap {
+            Some(tap) => {
+                // dup2 onto its own number is a no-op that would not clear
+                // FD_CLOEXEC. A slot queue can never legitimately be descriptor
+                // 3 in the server (it is held for the process lifetime), so
+                // refuse instead of handing over a queue that dies at exec.
+                anyhow::ensure!(
+                    tap.queue_fd != NET_TAP_FD,
+                    "TAP queue already occupies descriptor {NET_TAP_FD}"
+                );
+                Some((tap.queue_fd, NET_TAP_FD))
+            }
+            None => None,
+        };
 
         let stdout = open_log_stdio(stdout_path)?;
         let stderr = open_log_stdio(stderr_path)?;
         self.stderr_path = stderr_path.map(Path::to_path_buf);
 
-        cmd.stdout(stdout).stderr(stderr);
+        let spec = ScopedSpawnSpec {
+            argv: vec![
+                path_to_cstring(&firecracker_binary)?,
+                CString::from(c"--api-sock"),
+                path_to_cstring(&self.socket_path)?,
+                CString::from(c"--mmds-size-limit"),
+                CString::new(MMDS_SIZE_LIMIT.to_string()).expect("numeric literal is NUL-free"),
+                CString::from(c"--http-api-max-payload-size"),
+                CString::new(HTTP_API_MAX_PAYLOAD_SIZE.to_string())
+                    .expect("numeric literal is NUL-free"),
+            ],
+            cwd: Some(path_to_cstring(&self.work_dir)?),
+            stdout,
+            stderr,
+            process_group: true,
+            netns: netns.map(OwnedFd::from),
+            fd_handoff,
+            capabilities: &[],
+        };
 
-        let child = crate::privileges::spawn_tokio_command_scoped(cmd, &[], move || {
-            if let Some(netns) = netns {
-                // SAFETY: `netns` is an open network namespace descriptor and
-                // this short-lived launcher thread has not spawned a child yet.
-                let rc = unsafe { libc::setns(netns.as_raw_fd(), libc::CLONE_NEWNET) };
-                if rc != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            Ok(())
-        })
-        .await
-        .context("failed to spawn firecracker")?;
+        let child = crate::privileges::spawn_scoped(spec)
+            .await
+            .context("failed to spawn firecracker")?;
         trace!("firecracker process spawned");
 
         // Set oom_score_adj to maximum (1000) so the firecracker process is
         // the first candidate for OOM kill, protecting current agentenv server.
-        if let Some(pid) = child.id() {
-            let oom_path = format!("/proc/{pid}/oom_score_adj");
-            if let Err(e) = fs::write(&oom_path, b"1000") {
-                warn!(pid, oom_path, err = %e, "failed to set oom_score_adj for firecracker");
-            }
+        let pid = child.id();
+        let oom_path = format!("/proc/{pid}/oom_score_adj");
+        if let Err(e) = fs::write(&oom_path, b"1000") {
+            warn!(pid, oom_path, err = %e, "failed to set oom_score_adj for firecracker");
         }
 
         self.process = Some(child);
@@ -221,10 +274,9 @@ impl FirecrackerInstance {
 
         if let Some(mut child) = self.process.take() {
             // First try a graceful stop with SIGTERM
-            if let Some(pid) = child.id() {
-                trace!(pid, "sending SIGTERM to firecracker");
-                let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
-            }
+            let pid = child.id();
+            trace!(pid, "sending SIGTERM to firecracker");
+            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
 
             // Wait for the process to exit, but if it doesn't within the timeout, force kill it with SIGKILL
             if time::timeout(timeout, child.wait()).await.is_err() {
@@ -524,7 +576,7 @@ impl FirecrackerInstance {
         &self,
         snapshot_path: &Path,
         mem_backend_path: &Path,
-        network_overrides: &[(&str, &str)],
+        network_overrides: &[(String, String)],
         resume_vm: bool,
         track_dirty_pages: bool,
     ) -> Result<()> {
@@ -541,7 +593,7 @@ impl FirecrackerInstance {
                 network_overrides
                     .iter()
                     .map(|(iface_id, host_dev_name)| {
-                        NetworkOverride::new(iface_id.to_string(), host_dev_name.to_string())
+                        NetworkOverride::new(iface_id.clone(), host_dev_name.clone())
                     })
                     .collect(),
             );
@@ -587,9 +639,10 @@ impl Drop for FirecrackerInstance {
     }
 }
 
-fn open_log_stdio(path: Option<&Path>) -> Result<Stdio> {
+fn open_log_stdio(path: Option<&Path>) -> Result<Option<fs::File>> {
     let Some(path) = path else {
-        return Ok(Stdio::null());
+        // The spawn spec routes missing streams to /dev/null.
+        return Ok(None);
     };
 
     if let Some(parent) = path.parent() {
@@ -601,7 +654,13 @@ fn open_log_stdio(path: Option<&Path>) -> Result<Stdio> {
         .append(true)
         .open(path)
         .with_context(|| format!("open firecracker log {}", path.display()))?;
-    Ok(Stdio::from(file))
+    Ok(Some(file))
+}
+
+/// Converts a path to a `CString` for the spawn spec's argv and cwd.
+fn path_to_cstring(path: &Path) -> Result<CString> {
+    CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("path {} contains an interior NUL byte", path.display()))
 }
 
 /// Parse a case-insensitive Firecracker log level string.
@@ -673,11 +732,11 @@ mod tests {
         let mut instance = FirecrackerInstance::new(temp.path().to_path_buf());
 
         instance
-            .spawn_with_netns(Path::new("/bin/true"), None, None, None)
+            .spawn_with_netns(Path::new("/bin/true"), None, None, None, None)
             .await?;
 
         let err = instance
-            .spawn_with_netns(Path::new("/bin/true"), None, None, None)
+            .spawn_with_netns(Path::new("/bin/true"), None, None, None, None)
             .await
             .expect_err("second spawn should fail");
 
@@ -692,7 +751,7 @@ mod tests {
         let socket_path = {
             let mut instance = FirecrackerInstance::new(temp.path().to_path_buf());
             instance
-                .spawn_with_netns(Path::new("/bin/true"), None, None, None)
+                .spawn_with_netns(Path::new("/bin/true"), None, None, None, None)
                 .await?;
             fs::write(&instance.socket_path, b"owned socket")?;
             instance.socket_path.clone()
@@ -723,7 +782,7 @@ mod tests {
         let status = StdCommand::new("sh")
             .arg("-c")
             .arg("printf first")
-            .stdout(open_log_stdio(Some(&log_path))?)
+            .stdout(open_log_stdio(Some(&log_path))?.expect("log file"))
             .status()?;
         assert!(status.success());
         assert_eq!(fs::read_to_string(&log_path)?, "first");
@@ -731,7 +790,7 @@ mod tests {
         let status = StdCommand::new("sh")
             .arg("-c")
             .arg("printf second")
-            .stdout(open_log_stdio(Some(&log_path))?)
+            .stdout(open_log_stdio(Some(&log_path))?.expect("log file"))
             .status()?;
         assert!(status.success());
         assert_eq!(fs::read_to_string(&log_path)?, "firstsecond");
@@ -753,6 +812,85 @@ mod tests {
             PathBuf::from("/tmp/vm_state.bin")
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn tap_handoff_host_dev_name_pins_descriptor_three() -> Result<()> {
+        let queue = OwnedFd::from(fs::File::open("/dev/null")?);
+        let tap = TapHandoff::new(&queue);
+        // A Firecracker without fdp: support treats the whole string as an
+        // interface name and fails loudly instead of silently mis-parsing.
+        assert_eq!(tap.host_dev_name(), "fdp:3:tap0");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires /dev/net/tun and CAP_NET_ADMIN to attach a TAP queue"]
+    async fn spawn_with_netns_hands_preopened_tap_descriptor_to_child() -> Result<()> {
+        use anyhow::ensure;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command as StdCommand;
+
+        use crate::sandbox::network::Slot;
+
+        // A persistent TAP interface the slot-owned queue can attach to.
+        let add = StdCommand::new("ip")
+            .args(["tuntap", "add", "tap-hdoff-t", "mode", "tap"])
+            .status()?;
+        ensure!(add.success(), "ip tuntap add failed");
+
+        let temp = tempdir()?;
+        // Stand-in binary: reports what fd 3 points at, then exits.
+        let probe = temp.path().join("probe");
+        fs::write(&probe, "#!/bin/sh\nreadlink /proc/self/fd/3\n")?;
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o755))?;
+        let stdout_path = temp.path().join("stdout.log");
+
+        let spawn_result = async {
+            // Stands in for the owning slot: attach once and hold the queue
+            // across the spawn, exactly like a slot does.
+            let queue =
+                Slot::attach_tap_queue("tap-hdoff-t").context("attach slot-owned tap queue")?;
+            let mut instance = FirecrackerInstance::new(temp.path().to_path_buf());
+            instance
+                .spawn_with_netns(
+                    &probe,
+                    Some(&stdout_path),
+                    None,
+                    None,
+                    Some(TapHandoff::new(&queue)),
+                )
+                .await?;
+            // stop() SIGTERMs the child; wait for the probe to run to
+            // completion first, or the signal can kill it before exec.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while instance
+                .process
+                .as_mut()
+                .expect("firecracker process")
+                .try_wait()
+                .context("check probe status")?
+                .is_none()
+            {
+                ensure!(Instant::now() < deadline, "probe did not exit within 5s");
+                time::sleep(Duration::from_millis(10)).await;
+            }
+            instance.stop(Duration::from_secs(5)).await
+        }
+        .await;
+
+        let del = StdCommand::new("ip")
+            .args(["tuntap", "del", "tap-hdoff-t", "mode", "tap"])
+            .status()?;
+        ensure!(del.success(), "ip tuntap del failed");
+
+        spawn_result?;
+        let stdout = fs::read_to_string(&stdout_path)?;
+        assert!(
+            stdout.contains("tun"),
+            "fd 3 is not a tun queue descriptor: {stdout}"
+        );
         Ok(())
     }
 }

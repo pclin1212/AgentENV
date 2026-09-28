@@ -5,9 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, Result};
-#[cfg(test)]
-use index_set::BitSet;
-use index_set::{slot_count, AtomicBitSet, SharedBitSet};
+use index_set::{slot_count, AtomicBitSet, BitSet, SharedBitSet};
 use ipnetwork::Ipv4Network;
 use nix::libc;
 use tracing::{debug, trace, warn};
@@ -240,11 +238,12 @@ impl NetworkManager {
         }
 
         // Fast path: reuse a warm slot from the pool.
-        if let Some(slot) = self.pool.try_acquire() {
+        if let Some(mut slot) = self.pool.try_acquire() {
             if self.shutting_down() {
                 let _ = self.cleanup_slot_and_release_bit(slot);
                 return Err(anyhow!(ERR_SHUTTING_DOWN));
             }
+            self.activate(&mut slot);
             debug!(slot = slot.idx, "reused warm network slot from pool");
             if self.pool.len() < self.pool.config().low_watermark {
                 self.pool.request_maintenance();
@@ -357,6 +356,21 @@ impl NetworkManager {
         Ok(())
     }
 
+    /// Marks a slot as entering active use, discarding frames that queued on
+    /// its TAP while idle: the host route to the slot's interaction IP
+    /// persists, so stray inbound traffic keeps arriving even with nothing
+    /// reading the queue. Every path attaching a slot to a sandbox funnels
+    /// through here or through [`Self::allocate_any`], so a new tenant never
+    /// observes a previous lifecycle's traffic.
+    pub(crate) fn activate(&self, slot: &mut Slot) {
+        debug_assert!(
+            self.allocated.has(slot.idx as usize),
+            "activating slot {} that is not marked allocated",
+            slot.idx
+        );
+        slot.drain_tap_queue();
+    }
+
     /// Release a network slot. If the pool has room the slot is cached warm for
     /// reuse by the next `allocate_any()` call.
     ///
@@ -366,10 +380,13 @@ impl NetworkManager {
     ///
     /// When pool maintenance is disabled, this keeps the previous bounded-pool
     /// behavior and cleans up immediately once the pool reaches high watermark.
-    pub fn release(&self, slot: Slot) -> Result<()> {
+    pub fn release(&self, mut slot: Slot) -> Result<()> {
         if self.shutting_down() {
             return self.cleanup_slot_and_release_bit(slot);
         }
+        // Discard frames that arrived while the sandbox was live: the next
+        // tenant of this pooled slot must not observe them.
+        slot.drain_tap_queue();
         let slot_idx = slot.idx;
         match self.pool.release(slot) {
             Ok(()) => {

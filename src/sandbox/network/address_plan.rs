@@ -5,6 +5,31 @@ use ipnetwork::Ipv4Network;
 
 use crate::cfg::NetworkConfig;
 
+/// The single guest MAC every VM boots with. Fresh boots pass it to
+/// Firecracker explicitly and template rebuilds bake it into the captured
+/// vm_state, so restores carry it too. Snapshots move between pooled slots
+/// and each slot's netns is its own L2 domain, so the constant needs no
+/// global uniqueness — it only removes the tenant-to-tenant MAC churn that
+/// leaves stale neighbour entries behind. Locally
+/// administered (0x02) unicast; the tail bytes spell "aenv" plus the
+/// planned vm_ip's last octet (…0.21).
+pub(crate) const GUEST_MAC: [u8; 6] = [0x02, 0x61, 0x65, 0x6e, 0x76, 0x21];
+
+/// The single tap0 MAC every slot presents. Pinned at slot creation so a
+/// restored guest's remembered `tap_ip -> tap0 MAC` entry is valid on any
+/// slot, not only the one its snapshot was captured on.
+pub(crate) const TAP_MAC: [u8; 6] = [0x02, 0x61, 0x65, 0x6e, 0x76, 0x22];
+
+/// Formats one of the plan MACs as the colon-separated lowercase string
+/// Firecracker's `NetworkInterface.guest_mac` expects.
+pub(crate) fn mac_string(octets: &[u8; 6]) -> String {
+    octets
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NetworkAddressPlan {
     host_interaction_cidr: Ipv4Network,

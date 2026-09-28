@@ -12,7 +12,9 @@ use tracing::debug;
 use uuid::Uuid;
 
 use super::device::UblkDevice;
-use crate::cfg::{OverlaybdCompressionAlgorithm, SnapshotPublishCompressionConfig};
+use crate::cfg::{
+    MemorySnapshotConfig, OverlaybdCompressionAlgorithm, SnapshotPublishCompressionConfig,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OverlaybdCompactOutput {
@@ -43,6 +45,25 @@ impl OverlaybdCompactOutput {
             Self::Raw
         }
     }
+
+    /// Resolve the pause-time memory layer output mode from
+    /// `[memory_snapshot].compression_enabled`. Disabled by default so pause
+    /// keeps producing raw layers with no resume decompression cost; enabled,
+    /// the algorithm and worker count come from
+    /// `[snapshot.publish_compression]` so pause artifacts stay in the format
+    /// publish uploads and pass through unchanged.
+    pub(crate) fn from_memory_snapshot_config(
+        memory: &MemorySnapshotConfig,
+        publish: &SnapshotPublishCompressionConfig,
+    ) -> Self {
+        if !memory.compression_enabled {
+            return Self::Raw;
+        }
+        Self::ZFile {
+            algorithm: publish.algorithm,
+            workers: publish.workers.clamp(1, Self::MAX_COMPRESSION_WORKERS),
+        }
+    }
 }
 
 pub(crate) async fn create_commit_args(
@@ -63,8 +84,12 @@ pub(crate) async fn create_commit_args(
                 0,
             ));
             compress_args.workers = workers.max(1);
+            // Pool retention sized to chunk concurrency: steady-state chunks
+            // recycle staging buffers instead of allocating fresh ones.
+            let pool_capacity = concurrency.clamp(1, 1024);
             CommitArgs::from_writer(Arc::new(
-                ZFileCompactWriter::new(output, &compress_args).await?,
+                ZFileCompactWriter::with_pool_capacity(output, &compress_args, pool_capacity)
+                    .await?,
             ))
         }
     };
@@ -365,6 +390,44 @@ mod tests {
             OverlaybdCompactOutput::from_publish_compression_config(&clamped),
             OverlaybdCompactOutput::ZFile {
                 algorithm: OverlaybdCompressionAlgorithm::Lz4,
+                workers: OverlaybdCompactOutput::MAX_COMPRESSION_WORKERS,
+            }
+        );
+    }
+
+    #[test]
+    fn compact_output_from_memory_snapshot_config() {
+        let disabled = MemorySnapshotConfig::default();
+        assert!(!disabled.compression_enabled);
+        assert_eq!(
+            OverlaybdCompactOutput::from_memory_snapshot_config(
+                &disabled,
+                &SnapshotPublishCompressionConfig {
+                    enabled: true,
+                    algorithm: OverlaybdCompressionAlgorithm::Zstd,
+                    workers: 4,
+                }
+            ),
+            OverlaybdCompactOutput::Raw
+        );
+
+        let enabled = MemorySnapshotConfig {
+            compression_enabled: true,
+            ..MemorySnapshotConfig::default()
+        };
+        // Algorithm and workers are inherited from the publish compression
+        // config; oversized workers clamp to the maximum.
+        assert_eq!(
+            OverlaybdCompactOutput::from_memory_snapshot_config(
+                &enabled,
+                &SnapshotPublishCompressionConfig {
+                    enabled: false,
+                    algorithm: OverlaybdCompressionAlgorithm::Zstd,
+                    workers: usize::MAX,
+                }
+            ),
+            OverlaybdCompactOutput::ZFile {
+                algorithm: OverlaybdCompressionAlgorithm::Zstd,
                 workers: OverlaybdCompactOutput::MAX_COMPRESSION_WORKERS,
             }
         );

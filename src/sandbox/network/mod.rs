@@ -10,7 +10,7 @@ use std::path::Path;
 
 use anyhow::Context;
 
-pub(crate) use address_plan::NetworkAddressPlan;
+pub(crate) use address_plan::{mac_string, NetworkAddressPlan, GUEST_MAC, TAP_MAC};
 pub(crate) use manager::NetworkManager;
 pub use policy::{
     BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,

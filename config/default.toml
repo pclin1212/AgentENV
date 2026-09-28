@@ -50,6 +50,16 @@ socket_poll_ms = 1
 # Setting serial_dir alone does not enable logging.
 # log_level = "Info"
 
+# Pre-open the sandbox TAP queue when the network slot is created and hold the
+# descriptor for the slot's lifetime. The queue is attached with its vnet
+# header size and offload features preset, and spawns hand it to Firecracker
+# as an "fdp:<fd>:<name>" host_dev_name spec (a plain dup in the child), so
+# pausing or exiting Firecracker never detaches the queue and Firecracker
+# skips its validation, vnet-header, and (when the guest negotiation matches
+# the preset) offload ioctls. Requires a Firecracker build with fdp: spec
+# support; set to false when running an unpatched binary.
+# preopen_tap = true
+
 [kernel]
 # Use an existing uncompressed Linux kernel image instead of downloading one.
 # The file must be a readable, non-empty regular file.
@@ -351,6 +361,13 @@ fill_concurrency = 4
 # It is automatically disabled for PVM. Memory snapshot packaging always uses the direct
 # OverlayBD path. Disable with AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false.
 track_dirty_pages = true
+
+# Compress memory layers as ZFile when pausing instead of leaving them raw.
+# Disabled by default so local pause/resume pays no decompression cost. The
+# algorithm and worker count come from [snapshot.publish_compression], so
+# pause artifacts stay in the format publish uploads and pass through
+# unchanged.
+compression_enabled = false
 
 [memory_snapshot.background_download]
 # Download missing blocks from remote memory layers; never start before envd

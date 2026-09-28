@@ -420,11 +420,13 @@ Source-registry image publication. Only takes effect when `snapshot.repository_b
 ## `[snapshot.publish_compression]`
 
 Publish-time compression for snapshot layers uploaded to OSS/ACR. Local layers
-always stay raw, so local resume pays no decompression cost; enabled by default,
-memory layers and incremental read-write layers are compressed once as they
-are uploaded, cutting network bytes for cross-node resume. This is the only
-compression switch; the legacy capture-time knobs under `[memory_snapshot]`
-and `[template_build]` were removed from the configuration schema.
+stay raw by default, so local resume pays no decompression cost; enabled by
+default, memory layers and incremental read-write layers are compressed once
+as they are uploaded, cutting network bytes for cross-node resume. The
+algorithm and worker count here also drive pause-time memory layer compression
+when `[memory_snapshot].compression_enabled` opts in, so pause artifacts stay
+in the same format publish uploads and pass through unchanged. Rootfs layers
+always stay raw at capture.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -560,6 +562,7 @@ the default path on every startup.
 |-----|------|---------|-------------|
 | `overlaybd_global_config_path` | string | `"$AENV_HOME/overlaybd/mem-overlaybd-global.json"` | Path to the overlaybd global config used for the memory-snapshot ublk backend. Regenerated at startup (manual edits are overwritten); change only to relocate the generated file. |
 | `track_dirty_pages` | bool | `true` | Enable Firecracker KVM dirty-page tracking for memory snapshots. PVM automatically disables it because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set `AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false` to disable it. |
+| `compression_enabled` | bool | `false` | Compress memory snapshot layers as ZFile when pausing instead of leaving them raw. Disabled by default so local pause/resume pays no decompression cost; the algorithm and worker count come from `[snapshot.publish_compression]`, so pause artifacts stay in the format publish uploads and pass through unchanged. Rootfs layers always stay raw. |
 
 ## `[memory_snapshot.background_download]`
 

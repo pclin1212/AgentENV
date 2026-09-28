@@ -14,6 +14,7 @@ use std::cell::{Cell, RefCell};
 use std::cmp::min;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use storage_util::{FixedBufferPool, PooledBuffer, SlabSlice};
 
 pub const MAX_READ_SIZE: usize = 65_536;
 
@@ -1461,7 +1462,9 @@ fn compress_data(
 }
 
 struct CompressedSegment {
-    bytes: Vec<u8>,
+    /// Window over exactly the bytes this segment wrote; pooled backing
+    /// recycles on drop.
+    bytes: SlabSlice,
     block_lengths: Vec<u32>,
 }
 
@@ -1478,12 +1481,47 @@ fn max_compressed_block_size(compressor: &dyn Compressor, gen_crc: bool) -> Resu
         .context("buffer size overflow")
 }
 
+/// Scratch space for one segment's compressed output: pooled when the
+/// caller's pool covers the worst-case capacity, freshly allocated otherwise.
+enum SegmentOutput {
+    Pooled(PooledBuffer),
+    Owned(Vec<u8>),
+}
+
+impl SegmentOutput {
+    fn acquire(pool: &Arc<FixedBufferPool>, output_capacity: usize) -> Self {
+        if pool.size() >= output_capacity {
+            Self::Pooled(FixedBufferPool::acquire(pool))
+        } else {
+            Self::Owned(vec![0u8; output_capacity])
+        }
+    }
+
+    /// Expose only `[0..written]`: recycled pooled buffers carry stale tails.
+    fn into_written(self, written: usize) -> SlabSlice {
+        match self {
+            SegmentOutput::Pooled(buffer) => buffer.into_slice_len(written),
+            SegmentOutput::Owned(bytes) => SlabSlice::from_vec(bytes).slice(0..written),
+        }
+    }
+}
+
+impl AsMut<[u8]> for SegmentOutput {
+    fn as_mut(&mut self) -> &mut [u8] {
+        match self {
+            SegmentOutput::Pooled(buffer) => buffer.as_mut(),
+            SegmentOutput::Owned(bytes) => bytes.as_mut_slice(),
+        }
+    }
+}
+
 fn compress_segment(
     compressor: &mut dyn Compressor,
     source: &[u8],
     block_size: usize,
     max_compressed_block_size: usize,
     gen_crc: bool,
+    output_pool: &Arc<FixedBufferPool>,
 ) -> Result<CompressedSegment> {
     ensure!(block_size != 0, "block_size must be > 0");
     ensure!(
@@ -1495,9 +1533,9 @@ fn compress_segment(
     let output_capacity = block_count
         .checked_mul(max_compressed_block_size)
         .context("compressed segment size overflow")?;
-    let mut bytes = vec![0u8; output_capacity];
     let mut block_lengths = Vec::with_capacity(block_count);
     let mut output_offset = 0usize;
+    let mut output = SegmentOutput::acquire(output_pool, output_capacity);
 
     for block in source.chunks_exact(block_size) {
         let output_end = output_offset
@@ -1506,7 +1544,7 @@ fn compress_segment(
         let compressed_len = compress_data(
             compressor,
             block,
-            &mut bytes[output_offset..output_end],
+            &mut output.as_mut()[output_offset..output_end],
             gen_crc,
         )?;
         block_lengths.push(
@@ -1517,10 +1555,9 @@ fn compress_segment(
             .checked_add(compressed_len)
             .context("compressed segment offset overflow")?;
     }
-    bytes.truncate(output_offset);
 
     Ok(CompressedSegment {
-        bytes,
+        bytes: output.into_written(output_offset),
         block_lengths,
     })
 }
@@ -1530,7 +1567,7 @@ fn compress_segment(
 /// reassembled back into source order by the consumer.
 struct WorkItem {
     seq: usize,
-    source: Vec<u8>,
+    source: SlabSlice,
 }
 
 /// Completion returned by a persistent compression worker; `seq` matches the
@@ -1546,7 +1583,9 @@ struct CompressedBatch {
 /// compressor (zstd contexts are expensive to create) and loops on a shared
 /// bounded work queue, returning one [`CompressedBatch`] per [`WorkItem`].
 /// Both channels are bounded at `workers * 2` so submission backpressures
-/// instead of queueing unbounded segment buffers.
+/// instead of queueing unbounded segment buffers. Compressed-output buffers
+/// come from the shared `output_pool`: at most one in-flight segment per
+/// worker, so the pool covers the steady state.
 struct WorkerPool {
     work_tx: crossbeam_channel::Sender<WorkItem>,
     result_rx: crossbeam_channel::Receiver<CompressedBatch>,
@@ -1569,6 +1608,7 @@ impl WorkerPool {
         gen_crc: bool,
         block_size: usize,
         max_compressed_block_size: usize,
+        output_pool: Arc<FixedBufferPool>,
     ) -> Self {
         let workers = workers.clamp(1, Self::MAX_WORKERS);
         let (work_tx, work_rx) = crossbeam_channel::bounded::<WorkItem>(workers * 2);
@@ -1580,6 +1620,7 @@ impl WorkerPool {
         for _ in 0..workers {
             let work_rx = work_rx.clone();
             let result_tx = result_tx.clone();
+            let output_pool = output_pool.clone();
             #[cfg(test)]
             let panic_on_work = panic_on_work.clone();
             handles.push(std::thread::spawn(move || {
@@ -1626,6 +1667,7 @@ impl WorkerPool {
                             block_size,
                             max_compressed_block_size,
                             gen_crc,
+                            &output_pool,
                         )
                     }))
                     .unwrap_or_else(|_payload| {
@@ -1702,6 +1744,11 @@ pub struct ZFileBuilder {
     /// Persistent compression workers, created when `args.workers > 1`.
     /// `None` means multi-block writes fall back to the in-line compressor.
     pool: Option<WorkerPool>,
+    /// Recycle pool for compressed-segment output buffers (see
+    /// [`compress_segment`]): sized to the worst-case encoding of one write
+    /// batch, capped at the fan-out width (one live buffer per segment), so
+    /// steady-state writes never allocate.
+    output_pool: Arc<FixedBufferPool>,
     block_len: Vec<u32>,
     compressed_data: Vec<u8>,
     reserved_buf: Vec<u8>,
@@ -1726,14 +1773,24 @@ impl ZFileBuilder {
             .context("buffer size overflow")?;
 
         let compressor = create_compressor(args)?;
+        let gen_crc = args.opt.verify != 0;
+        let max_block_size = max_compressed_block_size(compressor.as_ref(), gen_crc)?;
+        // One buffer per concurrently-live segment: `workers` under fan-out,
+        // one on the in-line path. Buffers allocate lazily on first use.
+        let output_pool = FixedBufferPool::new(
+            write_batch_size(block_size)?
+                .checked_mul(max_block_size)
+                .context("compressed output pool size overflow")?,
+            args.workers.clamp(1, WorkerPool::MAX_WORKERS),
+        );
         let pool = if args.workers > 1 {
-            let gen_crc = args.opt.verify != 0;
             Some(WorkerPool::new(
                 args.workers,
                 args.opt,
                 gen_crc,
                 block_size,
-                max_compressed_block_size(compressor.as_ref(), gen_crc)?,
+                max_block_size,
+                output_pool.clone(),
             ))
         } else {
             None
@@ -1745,6 +1802,7 @@ impl ZFileBuilder {
             opt: args.opt,
             compressor,
             pool,
+            output_pool,
             block_len: Vec::new(),
             compressed_data: vec![0u8; buf_size],
             reserved_buf: vec![0u8; buf_size],
@@ -1833,6 +1891,7 @@ impl ZFileBuilder {
             block_size,
             max_block_size,
             self.opt.verify != 0,
+            &self.output_pool,
         )?;
         self.commit_compressed_batch(batch).await
     }
@@ -1852,10 +1911,13 @@ impl ZFileBuilder {
             return self.compress_and_commit(source, block_size).await;
         }
 
-        self.write_full_blocks_owned(source.to_vec()).await
+        // Cold path (small metadata batches): one copy into an unpooled slab
+        // so the fan-out below can slice it across workers.
+        self.write_full_blocks_sliced(SlabSlice::from_vec(source.to_vec()))
+            .await
     }
 
-    async fn write_full_blocks_owned(&mut self, source: Vec<u8>) -> Result<()> {
+    async fn write_full_blocks_sliced(&mut self, source: SlabSlice) -> Result<()> {
         let block_size = usize::try_from(self.opt.block_size).context("invalid block_size")?;
         ensure!(
             source.len().is_multiple_of(block_size),
@@ -1872,11 +1934,13 @@ impl ZFileBuilder {
 
         // Persistent-pool fan-out: split the batch into per-worker segments,
         // submit them all, then collect every result before committing in
-        // `seq` order. No `.await` happens while pool results are
-        // outstanding, so dropping this future mid-write can never strand
-        // stale results in the pool for the next call (cancellation safety).
-        // `submit` never blocks here: a batch submits at most `workers`
-        // items into a `workers * 2` channel that the previous round drained.
+        // `seq` order. Segments are zero-copy slices of the same pooled
+        // buffer, so fan-out adds no per-worker copies or allocations. No
+        // `.await` happens while pool results are outstanding, so dropping
+        // this future mid-write can never strand stale results in the pool
+        // for the next call (cancellation safety). `submit` never blocks
+        // here: a batch submits at most `workers` items into a `workers * 2`
+        // channel that the previous round drained.
         // TODO: `pool.recv()` below blocks the calling async task for the
         // duration of one batch's compression (bounded and deadlock-free,
         // but it parks a current-thread runtime). If server-side latency
@@ -1901,7 +1965,7 @@ impl ZFileBuilder {
                     .context("source offset overflow")?;
                 if let Err(error) = pool.submit(WorkItem {
                     seq: pending,
-                    source: source[segment_begin..segment_end].to_vec(),
+                    source: source.slice(segment_begin..segment_end),
                 }) {
                     first_error = Some(error);
                     break;
@@ -2002,25 +2066,24 @@ impl ZFileBuilder {
         Ok(expected)
     }
 
-    async fn write_owned(&mut self, mut buffer: Vec<u8>, len: usize) -> Result<usize> {
-        ensure!(len <= buffer.len(), "write length exceeds buffer");
+    async fn write_sliced(&mut self, data: SlabSlice) -> Result<usize> {
         ensure!(!self.finished, "builder already closed");
 
+        let len = data.len();
         let block_size = self.opt.block_size as usize;
         if self.reserved_size != 0 || !len.is_multiple_of(block_size) {
-            return self.write(&buffer[..len]).await;
+            return self.write(&data).await;
         }
 
         let next_raw_data_size = self
             .raw_data_size
             .checked_add(len as u64)
             .context("raw_data_size overflow")?;
-        buffer.truncate(len);
 
         // The compact writer only hands over buffers of at most
         // ZFILE_COMPACT_WRITER_BUFFER_SIZE and `len` covers a whole number
         // of blocks, so a single batch always spans the whole buffer.
-        self.write_full_blocks_owned(buffer).await?;
+        self.write_full_blocks_sliced(data).await?;
 
         self.raw_data_size = next_raw_data_size;
         Ok(len)
@@ -2090,6 +2153,11 @@ fn write_batch_size(block_size: usize) -> Result<usize> {
 
 pub struct ZFileCompactWriter {
     state: tokio::sync::Mutex<ZFileCompactWriterState>,
+    /// Staging-buffer recycle pool for `alloc_buffer`: keeps the fill path
+    /// (`process_vm_readv` for memory snapshots) writing into already-faulted
+    /// pages instead of fresh large allocations every chunk, and lets the
+    /// worker fan-out slice each buffer without copying.
+    pool: Arc<FixedBufferPool>,
 }
 
 struct ZFileCompactWriterState {
@@ -2101,6 +2169,18 @@ struct ZFileCompactWriterState {
 
 impl ZFileCompactWriter {
     pub async fn new(destination: Arc<dyn VirtualFile>, args: &CompressArgs) -> Result<Self> {
+        // Default retention covers the memory-snapshot compact concurrency.
+        Self::with_pool_capacity(destination, args, 32).await
+    }
+
+    /// Build a writer whose staging-buffer pool retains up to `capacity`
+    /// idle buffers. Match `capacity` to the compact chunk concurrency so
+    /// steady-state writes never allocate.
+    pub async fn with_pool_capacity(
+        destination: Arc<dyn VirtualFile>,
+        args: &CompressArgs,
+        capacity: usize,
+    ) -> Result<Self> {
         Ok(Self {
             state: tokio::sync::Mutex::new(ZFileCompactWriterState {
                 builder: ZFileBuilder::new(destination, args).await?,
@@ -2108,6 +2188,7 @@ impl ZFileCompactWriter {
                 finalized: false,
                 failed: false,
             }),
+            pool: FixedBufferPool::new(ZFILE_COMPACT_WRITER_BUFFER_SIZE, capacity.max(1)),
         })
     }
 
@@ -2143,7 +2224,7 @@ impl ZFileCompactWriter {
 #[async_trait]
 impl storage_util::CompactWriter for ZFileCompactWriter {
     async fn alloc_buffer(&self) -> Result<Box<dyn storage_util::CompactBuffer>> {
-        Ok(Box::new(vec![0u8; ZFILE_COMPACT_WRITER_BUFFER_SIZE]))
+        Ok(Box::new(FixedBufferPool::acquire(&self.pool)))
     }
 
     fn buffer_size(&self) -> usize {
@@ -2160,10 +2241,7 @@ impl storage_util::CompactWriter for ZFileCompactWriter {
         offset: u64,
         len: usize,
     ) -> Result<()> {
-        let buffer = buf
-            .into_any()
-            .downcast::<Vec<u8>>()
-            .map_err(|_| anyhow::anyhow!("zfile compact writer requires Vec<u8> buffers"))?;
+        let data = slab_slice_from_compact_buffer(buf, len)?;
         let mut state = self.state.lock().await;
         ensure!(!state.finalized, "zfile compact writer already finalized");
         ensure!(
@@ -2179,7 +2257,7 @@ impl storage_util::CompactWriter for ZFileCompactWriter {
             .checked_add(len as u64)
             .context("zfile compact writer logical offset overflow")?;
         state.failed = true;
-        let written = match state.builder.write_owned(*buffer, len).await {
+        let written = match state.builder.write_sliced(data).await {
             Ok(written) => written,
             Err(error) => return Err(error),
         };
@@ -2221,6 +2299,25 @@ impl storage_util::CompactWriter for ZFileCompactWriter {
         state.failed = false;
         Ok(())
     }
+}
+
+/// Convert an `alloc_buffer` staging buffer into the shared slice the
+/// builder consumes; the bytes hand off to the compression workers without
+/// copying and recycle when the last reference drops.
+fn slab_slice_from_compact_buffer(
+    buf: Box<dyn storage_util::CompactBuffer>,
+    len: usize,
+) -> Result<SlabSlice> {
+    let buffer = buf
+        .into_any()
+        .downcast::<PooledBuffer>()
+        .map_err(|_| anyhow::anyhow!("zfile compact writer requires pooled buffers"))?;
+    let buffer = *buffer;
+    ensure!(
+        len <= buffer.as_ref().len(),
+        "write length {len} exceeds pooled buffer size"
+    );
+    Ok(buffer.into_slice().slice(0..len))
 }
 
 pub async fn new_zfile_builder(
@@ -2693,6 +2790,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_writer_recycles_staging_buffers_across_batches() {
+        // Mirror the `buffered(concurrency)` chunk pipeline: within a round
+        // several buffers are acquired before any write completes, so the
+        // pool must hold one buffer per in-flight chunk; later rounds must
+        // not allocate fresh staging buffers. The final partial batch also
+        // covers the non-block-aligned fallback path.
+        let backing = Arc::new(CountingMemoryFile::new(Vec::new()));
+        let args = CompressArgs {
+            opt: CompressOptions::new(CompressOptions::LZ4, 4096, 1),
+            overwrite_header: false,
+            workers: 4,
+        };
+        let writer = ZFileCompactWriter::with_pool_capacity(backing.clone(), &args, 4)
+            .await
+            .expect("create compact writer");
+        let batch = sample_data(ZFILE_COMPACT_WRITER_BUFFER_SIZE);
+        let tail = sample_data(3 * 4096 + 123);
+
+        let mut expected = Vec::new();
+        let mut offset = 0u64;
+        for round in 0..3 {
+            let mut buffers = Vec::new();
+            for _ in 0..4 {
+                buffers.push(
+                    storage_util::CompactWriter::alloc_buffer(&writer)
+                        .await
+                        .expect("alloc buffer"),
+                );
+            }
+            for (i, mut buffer) in buffers.into_iter().enumerate() {
+                let chunk = if round == 2 && i == 3 { &tail } else { &batch };
+                buffer.as_mut().as_mut()[..chunk.len()].copy_from_slice(chunk);
+                storage_util::CompactWriter::write(&writer, buffer, offset, chunk.len())
+                    .await
+                    .expect("write chunk");
+                offset += chunk.len() as u64;
+                expected.extend_from_slice(chunk);
+            }
+        }
+        assert_eq!(
+            writer.pool.allocations(),
+            4,
+            "steady-state rounds must recycle staging buffers"
+        );
+        storage_util::CompactWriter::finalize(&writer)
+            .await
+            .expect("finalize");
+
+        let ro = zfile_open_ro(backing.clone(), true)
+            .await
+            .expect("open zfile");
+        seqread_compare(&expected, &ro).await;
+    }
+
+    #[tokio::test]
+    async fn compact_writer_recycles_compressed_output_buffers() {
+        // Each 512 KiB batch fans out into one segment per worker, so the
+        // builder's output pool must hold one buffer per worker segment in
+        // steady state instead of allocating per segment.
+        let backing = Arc::new(CountingMemoryFile::new(Vec::new()));
+        let args = CompressArgs {
+            opt: CompressOptions::new(CompressOptions::LZ4, 4096, 1),
+            overwrite_header: false,
+            workers: 4,
+        };
+        let writer = ZFileCompactWriter::with_pool_capacity(backing.clone(), &args, 4)
+            .await
+            .expect("create compact writer");
+        let batch = sample_data(ZFILE_COMPACT_WRITER_BUFFER_SIZE);
+
+        let mut expected = Vec::new();
+        let mut offset = 0u64;
+        for round in 0..3 {
+            let mut buffer = storage_util::CompactWriter::alloc_buffer(&writer)
+                .await
+                .expect("alloc buffer");
+            buffer.as_mut().as_mut()[..batch.len()].copy_from_slice(&batch);
+            storage_util::CompactWriter::write(&writer, buffer, offset, batch.len())
+                .await
+                .expect("write chunk");
+            offset += batch.len() as u64;
+            expected.extend_from_slice(&batch);
+
+            let allocations = writer.state.lock().await.builder.output_pool.allocations();
+            assert!(
+                allocations <= args.workers,
+                "round {round}: output pool allocations {allocations} exceed the per-batch live set"
+            );
+        }
+        assert_eq!(
+            writer.state.lock().await.builder.output_pool.allocations(),
+            args.workers,
+            "steady-state rounds must recycle compressed output buffers"
+        );
+        storage_util::CompactWriter::finalize(&writer)
+            .await
+            .expect("finalize");
+
+        let ro = zfile_open_ro(backing.clone(), true)
+            .await
+            .expect("open zfile");
+        seqread_compare(&expected, &ro).await;
+    }
+
+    #[tokio::test]
     async fn compact_writer_fallback_writes_full_batch() {
         let data = sample_data(2 * ZFILE_COMPACT_WRITER_BUFFER_SIZE);
         let backing = Arc::new(CountingMemoryFile::new(Vec::new()));
@@ -2799,14 +3001,13 @@ mod tests {
     /// A poisoned compact writer rejects every later write and finalize
     /// with the poison error instead of running it.
     async fn assert_writer_poisoned(writer: &ZFileCompactWriter) {
-        let retry_error = storage_util::CompactWriter::write(
-            writer,
-            Box::new(sample_data(ZFILE_COMPACT_WRITER_BUFFER_SIZE)),
-            0,
-            ZFILE_COMPACT_WRITER_BUFFER_SIZE,
-        )
-        .await
-        .expect_err("write after poisoning must be rejected");
+        let buffer = storage_util::CompactWriter::alloc_buffer(writer)
+            .await
+            .expect("alloc buffer");
+        let retry_error =
+            storage_util::CompactWriter::write(writer, buffer, 0, ZFILE_COMPACT_WRITER_BUFFER_SIZE)
+                .await
+                .expect_err("write after poisoning must be rejected");
         assert!(retry_error
             .to_string()
             .contains("failed after previous write error"));
@@ -2825,13 +3026,19 @@ mod tests {
         let writer = ZFileCompactWriter::new(backing.clone(), &CompressArgs::default())
             .await
             .expect("create compact writer");
-        let data = sample_data(ZFILE_COMPACT_WRITER_BUFFER_SIZE);
+        let buffer = storage_util::CompactWriter::alloc_buffer(&writer)
+            .await
+            .expect("alloc buffer");
 
         backing.arm_write_failure();
-        let write_error =
-            storage_util::CompactWriter::write(&writer, Box::new(data.clone()), 0, data.len())
-                .await
-                .expect_err("armed destination write must fail");
+        let write_error = storage_util::CompactWriter::write(
+            &writer,
+            buffer,
+            0,
+            ZFILE_COMPACT_WRITER_BUFFER_SIZE,
+        )
+        .await
+        .expect_err("armed destination write must fail");
         assert!(write_error
             .to_string()
             .contains("injected data write failure"));
@@ -2852,14 +3059,20 @@ mod tests {
                 .await
                 .expect("create compact writer"),
         );
-        let data = sample_data(ZFILE_COMPACT_WRITER_BUFFER_SIZE);
-        let data_len = data.len();
+        let buffer = storage_util::CompactWriter::alloc_buffer(writer.as_ref())
+            .await
+            .expect("alloc buffer");
         backing.arm_data_writes();
 
         let task_writer = writer.clone();
         let write_task = tokio::spawn(async move {
-            storage_util::CompactWriter::write(task_writer.as_ref(), Box::new(data), 0, data_len)
-                .await
+            storage_util::CompactWriter::write(
+                task_writer.as_ref(),
+                buffer,
+                0,
+                ZFILE_COMPACT_WRITER_BUFFER_SIZE,
+            )
+            .await
         });
         backing.wait_for_second_data_write().await;
         write_task.abort();

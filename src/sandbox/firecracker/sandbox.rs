@@ -22,7 +22,7 @@ use super::overlaybd_snapshot::{
     restack_snapshot_overlaybd_device, restack_snapshot_overlaybd_rootfs,
 };
 use super::pool::{warm_stdio_paths, FirecrackerPool};
-use super::FirecrackerInstance;
+use super::{FirecrackerInstance, SANDBOX_NET_IFACE_ID, SANDBOX_TAP_IFACE_NAME};
 use crate::sandbox::custom_extension::{
     CustomExtensionClient, CustomExtensionHookGuard, CustomExtensionParams,
 };
@@ -40,7 +40,7 @@ use crate::sandbox::extra_drive::{
     prepare_extra_drives, DriveMount, ExtraDrive, ExtraDrivePrepareMode, ROOTFS_DRIVE_ID,
     USER_ROOTFS_DRIVE_ID, VOLUME_DRIVE_SLOT_PREFIX,
 };
-use crate::sandbox::network::{NetworkManager, SandboxNetworkPolicy, Slot};
+use crate::sandbox::network::{mac_string, NetworkManager, SandboxNetworkPolicy, Slot, GUEST_MAC};
 use crate::sandbox::process::Executor;
 use crate::sandbox::ublk::{
     OverlaybdCompactOutput, OverlaybdConfig, OverlaybdRuntimeHandle, PackRecordingWindow,
@@ -1182,10 +1182,17 @@ impl FirecrackerSandbox {
         snapshot_dir: &Path,
     ) -> Result<(FirecrackerSnapshotConfig, SandboxSnapshotManifest)> {
         let vm_state_path = snapshot_dir.join(VM_STATE_FILE_NAME);
-        // Local layers are always captured raw; when enabled, compression
-        // happens once at publish time under `[snapshot.publish_compression]`.
+        // Memory layers stay raw unless `[memory_snapshot].compression_enabled`
+        // opts pause into ZFile output; the algorithm and workers come from
+        // `[snapshot.publish_compression]`, so publish uploads the zfile bytes
+        // unchanged instead of recompressing them.
+        let global_config = ConfigManager::global_config();
+        let memory_output = OverlaybdCompactOutput::from_memory_snapshot_config(
+            &global_config.memory_snapshot,
+            &global_config.snapshot.publish_compression,
+        );
         let (mem_layer_path, mem_virtual_size) = self
-            .snapshot_memory_to_overlaybd(&vm_state_path, snapshot_dir, OverlaybdCompactOutput::Raw)
+            .snapshot_memory_to_overlaybd(&vm_state_path, snapshot_dir, memory_output)
             .await?;
 
         // Build the memory image config: collect parent layers, make runtime
@@ -1201,7 +1208,7 @@ impl FirecrackerSandbox {
             resume_mem_image_config_path,
             &mem_layer_path,
             snapshot_dir,
-            OverlaybdCompactOutput::Raw,
+            memory_output,
         )
         .await?;
         let mem_image_config_path = snapshot_dir.join("mem_image.json");
@@ -1503,6 +1510,18 @@ impl FirecrackerSandbox {
 
     fn uses_overlaybd_ublk(&self) -> bool {
         self.launch.common().ublk_config.is_some()
+    }
+
+    /// The `host_dev_name` for the sandbox interface: the `fdp:` spec
+    /// when the network slot hands off its pre-opened queue, the plain tap
+    /// name otherwise. Derived from [`Slot::tap_handoff`] so it can never
+    /// disagree with the spawn-side fd handoff.
+    fn sandbox_host_dev_name(&self) -> String {
+        self.network_slot
+            .as_ref()
+            .and_then(Slot::tap_handoff)
+            .map(|tap| tap.host_dev_name())
+            .unwrap_or_else(|| SANDBOX_TAP_IFACE_NAME.to_string())
     }
 
     fn mmds_metadata(&self, common: &FirecrackerCommonConfig) -> MmdsMetadata {
@@ -1871,9 +1890,11 @@ impl FirecrackerSandbox {
         boot_args =
             add_damon_monitor_region(boot_args, config.mem_size_mib, std::env::consts::ARCH);
 
-        // ── Spawn Firecracker inside the network namespace so it can access tap0 ──
+        // ── Spawn Firecracker inside the network namespace, handing it the
+        // slot-owned tap0 queue as a descriptor ──
         let firecracker_binary = config.common.firecracker_binary.clone();
         let (stdout_path, stderr_path) = self.firecracker_stdio_paths();
+        let tap = self.network_slot.as_ref().and_then(Slot::tap_handoff);
 
         self.fc_instance
             .spawn_with_netns(
@@ -1881,6 +1902,7 @@ impl FirecrackerSandbox {
                 stdout_path.as_deref(),
                 stderr_path.as_deref(),
                 Some(&netns),
+                tap,
             )
             .await?;
 
@@ -1949,7 +1971,13 @@ impl FirecrackerSandbox {
                     "using warm firecracker from pool"
                 );
 
-                self.network_slot = Some(warm.slot);
+                let mut slot = warm.slot;
+                // The warm Firecracker held fd 3 but never read while pooled,
+                // and this path bypasses `NetworkManager::release`; entering
+                // active use through the manager drains the shared queue for
+                // the restored guest.
+                NetworkManager::global().activate(&mut slot);
+                self.network_slot = Some(slot);
                 self.work_dir = warm.work_dir; // Update self.work_dir before relocating logs since the fallback log paths are relative to the work_dir.
                 let _cold = std::mem::replace(&mut self.fc_instance, warm.fc_instance);
                 if let Err(err) =
@@ -2078,6 +2106,7 @@ impl FirecrackerSandbox {
                     stdout_path.as_deref(),
                     stderr_path.as_deref(),
                     Some(&netns),
+                    self.network_slot.as_ref().and_then(Slot::tap_handoff),
                 )
                 .await?;
 
@@ -2209,7 +2238,10 @@ impl FirecrackerSandbox {
         self.configure_logger(&config.common).await?;
 
         // Override the network interface to use the new tap0 in our namespace
-        let network_overrides = [("eth0", "tap0")];
+        let network_overrides = [(
+            SANDBOX_NET_IFACE_ID.to_string(),
+            self.sandbox_host_dev_name(),
+        )];
         self.fc_instance
             .load_snapshot_file(
                 &vm_state_src,
@@ -2423,15 +2455,24 @@ impl FirecrackerSandbox {
         self.configure_extra_drives(&volume_slots).await?;
 
         if self.network_slot.is_some() {
-            // Network interface.
+            // Network interface. Every fresh VM boots with the plan's single
+            // guest MAC so template snapshots capture it and restores reuse
+            // it; a random per-VM MAC would leave stale neighbour entries in
+            // pooled slots.
             self.fc_instance
-                .add_network_interface("eth0", None, "tap0".to_string(), None, None)
+                .add_network_interface(
+                    SANDBOX_NET_IFACE_ID,
+                    Some(mac_string(&GUEST_MAC)),
+                    self.sandbox_host_dev_name(),
+                    None,
+                    None,
+                )
                 .await
                 .context("Failed to add network interface to microVM")?;
 
             // MMDS
             self.fc_instance
-                .set_mmds_config("eth0")
+                .set_mmds_config(SANDBOX_NET_IFACE_ID)
                 .await
                 .context("Failed to set MMDS network configuration")?;
             let mmds_metadata = self.mmds_metadata(&config.common);
@@ -2905,6 +2946,7 @@ mod tests {
                             stdout.as_deref(),
                             stderr.as_deref(),
                             None,
+                            None,
                         )
                         .await?;
                     sandbox
@@ -2957,6 +2999,7 @@ mod tests {
                     Path::new("/bin/echo"),
                     stdout.as_deref(),
                     stderr.as_deref(),
+                    None,
                     None,
                 )
                 .await?;

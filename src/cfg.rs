@@ -183,6 +183,17 @@ pub struct FirecrackerConfig {
     /// When set (non-empty), enables stdout/stderr capture and Firecracker logging
     /// to `firecracker.log` in the same directory. Unset/empty disables all three.
     pub log_level: Option<String>,
+    /// Pre-open the sandbox TAP queue when the network slot is created and
+    /// hold the descriptor for the slot's lifetime. The queue is attached
+    /// with its vnet header size and offload features preset, and spawns
+    /// hand it to Firecracker as an `fdp:<fd>:<name>` `host_dev_name` spec
+    /// (a plain dup in the child), so pausing or exiting Firecracker never
+    /// detaches the queue and Firecracker skips its validation, vnet-header,
+    /// and (when the guest negotiation matches the preset) offload ioctls.
+    /// Requires a Firecracker build with `fdp:` spec support; set
+    /// to false when running an unpatched binary.
+    #[config(default = true)]
+    pub preopen_tap: bool,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -530,6 +541,13 @@ pub struct MemorySnapshotConfig {
     /// Default: true; set the environment variable to false to use mincore.
     #[config(env = "AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES", default = true)]
     pub track_dirty_pages: bool,
+    /// Compress memory snapshot layers as ZFile when pausing instead of
+    /// leaving them raw. Default: false so local pause/resume keeps paying
+    /// no decompression cost; enabled, the algorithm and worker count come
+    /// from `[snapshot.publish_compression]` so pause artifacts stay in the
+    /// same format publish uploads and are passed through unchanged.
+    #[config(default = false)]
+    pub compression_enabled: bool,
     #[config(nested)]
     pub background_download: MemorySnapshotBackgroundDownloadConfig,
 }
@@ -1483,6 +1501,23 @@ mod tests {
     fn bundled_default_config_loads() -> Result<()> {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
         ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn memory_snapshot_compression_config_is_valid() -> Result<()> {
+        let default = MemorySnapshotConfig::default();
+        assert!(!default.compression_enabled);
+
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let config = ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
+        assert!(!config.config().memory_snapshot.compression_enabled);
+
+        let temp = tempdir()?;
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "[memory_snapshot]\ncompression_enabled = true\n")?;
+        let config = ConfigManager::new_from_path(&path)?;
+        assert!(config.config().memory_snapshot.compression_enabled);
         Ok(())
     }
 
