@@ -119,6 +119,8 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         sandbox_metrics: Mutex::new(SandboxMetrics::default()),
         sandbox_event_tx,
         default_sandbox_timeout: Duration::from_secs(15),
+        pause_limiter: LifecycleLimiter::new(0, Duration::from_secs(60), SandboxOperation::Pause),
+        resume_limiter: LifecycleLimiter::new(0, Duration::from_secs(60), SandboxOperation::Resume),
         is_shutting_down: std::sync::atomic::AtomicBool::new(false),
         shutdown_tx: tokio::sync::watch::channel(false).0,
         shutdown_outcome: tokio::sync::OnceCell::new(),
@@ -5805,4 +5807,243 @@ async fn sandbox_metrics_failure_is_not_zero_and_paused_guests_are_not_polled() 
     let metadata = orchestrator.store.get(&id).await.unwrap().unwrap();
     assert_eq!(metadata.state, SandboxState::Paused);
     assert_eq!(metadata.expires_at, expiration);
+}
+
+#[tokio::test]
+async fn admission_is_fifo_and_cancelled_waiters_do_not_consume_permits() {
+    use futures::poll;
+    let limiter = LifecycleLimiter::new(1, Duration::from_secs(60), SandboxOperation::Pause);
+    let permit = limiter.acquire().await.unwrap();
+    let mut first = Box::pin(limiter.acquire());
+    let mut second = Box::pin(limiter.acquire());
+    assert!(poll!(&mut first).is_pending());
+    assert!(poll!(&mut second).is_pending());
+    drop(permit);
+    // The slot is reserved for the first waiter even if the second polls first.
+    assert!(poll!(&mut second).is_pending());
+    drop(first);
+    let second_permit = second.await.unwrap();
+    let mut third = Box::pin(limiter.acquire());
+    assert!(poll!(&mut third).is_pending());
+    drop(second_permit);
+    assert!(third.await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn admission_timeout_removes_waiter_and_disabled_limit_does_not_wait() {
+    let limiter = LifecycleLimiter::new(1, Duration::from_millis(10), SandboxOperation::Resume);
+    let permit = limiter.acquire().await.unwrap();
+    assert!(matches!(
+        limiter.acquire().await,
+        Err(OrchestratorError::LifecycleQueueTimeout {
+            operation: SandboxOperation::Resume,
+            ..
+        })
+    ));
+    drop(permit);
+    assert!(limiter.acquire().await.unwrap().is_some());
+    let disabled = LifecycleLimiter::new(0, Duration::from_secs(60), SandboxOperation::Pause);
+    assert!(disabled.acquire().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn pause_and_resume_have_independent_capacity() {
+    use futures::poll;
+    let pause = LifecycleLimiter::new(1, Duration::from_secs(60), SandboxOperation::Pause);
+    let resume = LifecycleLimiter::new(2, Duration::from_secs(60), SandboxOperation::Resume);
+    let _pause = pause.acquire().await.unwrap();
+    let _resume1 = resume.acquire().await.unwrap();
+    let _resume2 = resume.acquire().await.unwrap();
+    let mut pause_waiter = Box::pin(pause.acquire());
+    let mut resume_waiter = Box::pin(resume.acquire());
+    assert!(poll!(&mut pause_waiter).is_pending());
+    assert!(poll!(&mut resume_waiter).is_pending());
+}
+
+fn make_admission_test_orchestrator(queue_timeout: Duration) -> Arc<TestOrchestrator> {
+    let mut orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
+    let inner = Arc::get_mut(&mut orchestrator).unwrap();
+    inner.pause_limiter = LifecycleLimiter::new(1, queue_timeout, SandboxOperation::Pause);
+    inner.resume_limiter = LifecycleLimiter::new(1, queue_timeout, SandboxOperation::Resume);
+    orchestrator
+}
+
+#[tokio::test]
+async fn lifecycle_admission_timeout_does_not_change_sandbox_state() -> Result<()> {
+    let orchestrator = make_admission_test_orchestrator(Duration::from_millis(10));
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let pause_permit = orchestrator.pause_limiter.acquire().await?;
+    assert!(matches!(
+        orchestrator.pause_sandbox(created.id).await,
+        Err(OrchestratorError::LifecycleQueueTimeout {
+            operation: SandboxOperation::Pause,
+            ..
+        })
+    ));
+    assert_eq!(
+        orchestrator.get_sandbox(&created.id).await?.unwrap().state,
+        SandboxState::Running
+    );
+    drop(pause_permit);
+    orchestrator.pause_sandbox(created.id).await?;
+
+    let resume_permit = orchestrator.resume_limiter.acquire().await?;
+    assert!(matches!(
+        orchestrator
+            .resume_sandbox(created.id, NewTimeout::UseExisting)
+            .await,
+        Err(OrchestratorError::LifecycleQueueTimeout {
+            operation: SandboxOperation::Resume,
+            ..
+        })
+    ));
+    assert_eq!(
+        orchestrator.get_sandbox(&created.id).await?.unwrap().state,
+        SandboxState::Paused
+    );
+    drop(resume_permit);
+    orchestrator
+        .resume_sandbox(created.id, NewTimeout::UseExisting)
+        .await?;
+    orchestrator.delete_sandbox(created.id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_admission_cancelled_waiters_never_start() -> Result<()> {
+    use futures::poll;
+    let orchestrator = make_admission_test_orchestrator(Duration::from_secs(60));
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let permit = orchestrator.pause_limiter.acquire().await?;
+    let mut waiting = Box::pin(orchestrator.pause_sandbox(created.id));
+    assert!(poll!(&mut waiting).is_pending());
+    drop(waiting);
+    drop(permit);
+    tokio::task::yield_now().await;
+    assert_eq!(
+        orchestrator.get_sandbox(&created.id).await?.unwrap().state,
+        SandboxState::Running
+    );
+    orchestrator.pause_sandbox(created.id).await?;
+
+    let permit = orchestrator.resume_limiter.acquire().await?;
+    let mut waiting = Box::pin(orchestrator.resume_sandbox(created.id, NewTimeout::UseExisting));
+    assert!(poll!(&mut waiting).is_pending());
+    drop(waiting);
+    drop(permit);
+    tokio::task::yield_now().await;
+    assert_eq!(
+        orchestrator.get_sandbox(&created.id).await?.unwrap().state,
+        SandboxState::Paused
+    );
+    // Dropping an admitted future before polling must also release its slot,
+    // without starting a detached operation.
+    let admitted = orchestrator
+        .admit_resume_sandbox(created.id, NewTimeout::UseExisting)
+        .await?;
+    drop(admitted);
+    assert_eq!(
+        orchestrator.get_sandbox(&created.id).await?.unwrap().state,
+        SandboxState::Paused
+    );
+    orchestrator
+        .resume_sandbox(created.id, NewTimeout::UseExisting)
+        .await?;
+    orchestrator.delete_sandbox(created.id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_admission_active_pause_keeps_slot_after_caller_cancellation() -> Result<()> {
+    use futures::poll;
+    let orchestrator = make_admission_test_orchestrator(Duration::from_secs(60));
+    let first = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let second = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let handle = orchestrator
+        .sandboxes
+        .read()
+        .await
+        .get(&first.id)
+        .unwrap()
+        .clone();
+    // Hold the backend lock so the admitted task cannot finish its pause.
+    let backend = handle.lock_owned().await;
+    let caller = {
+        let orchestrator = Arc::clone(&orchestrator);
+        tokio::spawn(async move { orchestrator.pause_sandbox(first.id).await })
+    };
+    wait_for_state(&orchestrator, &first.id, SandboxState::Pausing).await?;
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+
+    let mut queued = Box::pin(orchestrator.pause_sandbox(second.id));
+    assert!(poll!(&mut queued).is_pending());
+    assert_eq!(
+        orchestrator.get_sandbox(&second.id).await?.unwrap().state,
+        SandboxState::Running
+    );
+    drop(backend);
+    tokio::time::timeout(Duration::from_secs(5), queued)
+        .await
+        .unwrap()?;
+    assert_eq!(
+        orchestrator.get_sandbox(&first.id).await?.unwrap().state,
+        SandboxState::Paused
+    );
+    orchestrator.delete_sandbox(first.id).await?;
+    orchestrator.delete_sandbox(second.id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_admission_active_resume_keeps_slot_after_caller_cancellation() -> Result<()> {
+    use futures::poll;
+    let orchestrator = make_admission_test_orchestrator(Duration::from_secs(60));
+    let first = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let second = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    orchestrator.pause_sandbox(first.id).await?;
+    orchestrator.pause_sandbox(second.id).await?;
+    // A resumed VM must register in this map before completing its launch.
+    let runtimes = orchestrator.sandboxes.write().await;
+    let caller = {
+        let orchestrator = Arc::clone(&orchestrator);
+        tokio::spawn(async move {
+            orchestrator
+                .resume_sandbox(first.id, NewTimeout::UseExisting)
+                .await
+        })
+    };
+    wait_for_state(&orchestrator, &first.id, SandboxState::Resuming).await?;
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+
+    let mut queued = Box::pin(orchestrator.resume_sandbox(second.id, NewTimeout::UseExisting));
+    assert!(poll!(&mut queued).is_pending());
+    assert_eq!(
+        orchestrator.get_sandbox(&second.id).await?.unwrap().state,
+        SandboxState::Paused
+    );
+    drop(runtimes);
+    tokio::time::timeout(Duration::from_secs(5), queued)
+        .await
+        .unwrap()?;
+    assert_eq!(
+        orchestrator.get_sandbox(&first.id).await?.unwrap().state,
+        SandboxState::Running
+    );
+    orchestrator.delete_sandbox(first.id).await?;
+    orchestrator.delete_sandbox(second.id).await?;
+    Ok(())
 }

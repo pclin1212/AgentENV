@@ -23,6 +23,13 @@ home_path = "/var/lib/aenv"
 # AENV_VIRTUALIZATION_MODE overrides this value.
 virtualization_mode = "kvm"
 
+[api_server]
+# Independent per-server concurrency limits. 0 disables that operation's limit.
+pause_max_inflight = 0
+resume_max_inflight = 0
+# FIFO wait without a queue-size cap; operation execution time is not limited.
+queue_timeout_secs = 60
+
 [firecracker]
 # Use an existing Firecracker executable instead of downloading one. It must
 # be a readable, non-empty, executable regular file.

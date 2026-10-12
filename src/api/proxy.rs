@@ -786,15 +786,25 @@ async fn try_auto_resume(
     api_impl: &ApiImpl,
     sandbox_id: SandboxId,
 ) -> Result<(), ProxyRequestError> {
-    match timeout(
-        PROXY_AUTO_RESUME_TIMEOUT,
-        api_impl.orchestrator().resume_sandbox(
+    let resume = match api_impl
+        .orchestrator()
+        .admit_resume_sandbox(
             sandbox_id,
             NewTimeout::EnsureMinimum(auto_resume_min_sandbox_timeout()),
-        ),
-    )
-    .await
+        )
+        .await
     {
+        Ok(resume) => resume,
+        Err(err @ OrchestratorError::LifecycleQueueTimeout { .. }) => {
+            warn!(sandbox_id = %sandbox_id, error = %err, "sandbox auto-resume admission timed out");
+            return Err(ProxyRequestError::AutoResumeTimedOut(sandbox_id));
+        }
+        Err(err) => {
+            warn!(sandbox_id = %sandbox_id, error = %err, "sandbox auto-resume admission failed");
+            return Err(ProxyRequestError::AutoResumeFailed(sandbox_id));
+        }
+    };
+    match timeout(PROXY_AUTO_RESUME_TIMEOUT, resume).await {
         Ok(Ok(_)) => {
             debug!(sandbox_id = %sandbox_id, "sandbox auto-resume completed");
             Ok(())

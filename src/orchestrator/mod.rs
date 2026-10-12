@@ -83,6 +83,12 @@ pub enum OrchestratorError {
         operation: SandboxOperation,
     },
 
+    #[error("timed out after {timeout_secs}s waiting for a {operation:?} execution slot")]
+    LifecycleQueueTimeout {
+        operation: SandboxOperation,
+        timeout_secs: u64,
+    },
+
     #[error("store operation failed: {0}")]
     StoreOperationFailed(#[source] store::StoreError),
 

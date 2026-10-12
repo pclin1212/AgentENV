@@ -32,6 +32,20 @@ Packaged runtime dependency versions and download URLs live in
 installed. User configuration should contain runtime behavior and explicit
 local path overrides, not the default dependency catalog.
 
+## `[api_server]`
+
+Independent pause/resume concurrency limits per server process; restart to apply.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `pause_max_inflight` | 0 | Concurrent pause calls; 0 disables the limit |
+| `resume_max_inflight` | 0 | Concurrent resume calls; 0 disables the limit |
+| `queue_timeout_secs` | 60 | Positive maximum queue wait in seconds; excludes execution time |
+
+Requests wait FIFO with no queue-size cap. Queue timeout returns HTTP 500 for
+lifecycle APIs or 504 for proxy auto-resume. Connect and proxy auto-resume share
+the resume limit; connect to a running sandbox does not consume a slot.
+
 ## `[firecracker]`
 
 Firecracker VM binary and boot configuration.

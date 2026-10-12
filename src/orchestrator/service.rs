@@ -6,7 +6,9 @@ use std::sync::{
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
-use tokio::sync::{broadcast, oneshot, watch, Mutex, OnceCell, RwLock};
+use tokio::sync::{
+    broadcast, oneshot, watch, Mutex, OnceCell, OwnedSemaphorePermit, RwLock, Semaphore,
+};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, trace, warn};
 
@@ -105,6 +107,39 @@ impl FailedLaunchStage {
     }
 }
 
+/// FIFO admission without a queue-size cap. Waiting remains in the caller's
+/// future; only an admitted operation may move into a cancellation-safe task.
+struct LifecycleLimiter {
+    semaphore: Option<Arc<Semaphore>>,
+    queue_timeout: Duration,
+    operation: SandboxOperation,
+}
+
+impl LifecycleLimiter {
+    fn new(max_inflight: usize, queue_timeout: Duration, operation: SandboxOperation) -> Self {
+        Self {
+            semaphore: (max_inflight > 0).then(|| Arc::new(Semaphore::new(max_inflight))),
+            queue_timeout,
+            operation,
+        }
+    }
+
+    async fn acquire(&self) -> Result<Option<OwnedSemaphorePermit>> {
+        let Some(semaphore) = &self.semaphore else {
+            return Ok(None);
+        };
+        match tokio::time::timeout(self.queue_timeout, Arc::clone(semaphore).acquire_owned()).await
+        {
+            Ok(Ok(permit)) => Ok(Some(permit)),
+            Ok(Err(_)) => Err(OrchestratorError::ShuttingDown),
+            Err(_) => Err(OrchestratorError::LifecycleQueueTimeout {
+                operation: self.operation,
+                timeout_secs: self.queue_timeout.as_secs(),
+            }),
+        }
+    }
+}
+
 pub struct Orchestrator<
     S: MetadataStore = InMemoryMetadataStore,
     F: SandboxBackendFactory = FirecrackerSandboxFactory,
@@ -122,6 +157,8 @@ pub struct Orchestrator<
     sandbox_metrics: Mutex<SandboxMetrics>,
     sandbox_event_tx: broadcast::Sender<SandboxLifecycleEvent>,
     default_sandbox_timeout: Duration,
+    pause_limiter: LifecycleLimiter,
+    resume_limiter: LifecycleLimiter,
     is_shutting_down: std::sync::atomic::AtomicBool,
     shutdown_tx: watch::Sender<bool>,
     shutdown_outcome: OnceCell<ShutdownOutcome>,
@@ -241,6 +278,16 @@ where
             sandbox_metrics: Mutex::new(SandboxMetrics::default()),
             sandbox_event_tx,
             default_sandbox_timeout: Duration::from_secs(config.default_sandbox_timeout_secs),
+            pause_limiter: LifecycleLimiter::new(
+                app_config.api_server.pause_max_inflight,
+                Duration::from_secs(app_config.api_server.queue_timeout_secs),
+                SandboxOperation::Pause,
+            ),
+            resume_limiter: LifecycleLimiter::new(
+                app_config.api_server.resume_max_inflight,
+                Duration::from_secs(app_config.api_server.queue_timeout_secs),
+                SandboxOperation::Resume,
+            ),
             is_shutting_down: std::sync::atomic::AtomicBool::new(false),
             shutdown_tx,
             shutdown_outcome: OnceCell::new(),
@@ -1389,8 +1436,11 @@ where
     /// sandbox (`Pausing` state), this call waits for it to complete and then
     /// returns the outcome rather than duplicating the work.
     pub async fn pause_sandbox(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+        // Do not spawn or change sandbox state while waiting for admission.
+        let permit = self.pause_limiter.acquire().await?;
         let this = Arc::clone(self);
         self.run_cancellation_safe("pause", sandbox_id, async move {
+            let _permit = permit;
             this.pause_sandbox_inner(sandbox_id).await
         })
         .await
@@ -1633,11 +1683,28 @@ where
         sandbox_id: SandboxId,
         timeout: NewTimeout,
     ) -> Result<SandboxMetadata> {
+        self.admit_resume_sandbox(sandbox_id, timeout).await?.await
+    }
+
+    /// Admit before spawning. The proxy applies its existing execution timeout
+    /// to the returned future, not to queue waiting.
+    pub(crate) async fn admit_resume_sandbox(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        timeout: NewTimeout,
+    ) -> Result<impl std::future::Future<Output = Result<SandboxMetadata>> + Send + 'static> {
+        let permit = self.resume_limiter.acquire().await?;
         let this = Arc::clone(self);
-        self.run_cancellation_safe("resume", sandbox_id, async move {
-            this.resume_sandbox_inner(sandbox_id, timeout).await
+        Ok(async move {
+            let task_orchestrator = Arc::clone(&this);
+            this.run_cancellation_safe("resume", sandbox_id, async move {
+                let _permit = permit;
+                task_orchestrator
+                    .resume_sandbox_inner(sandbox_id, timeout)
+                    .await
+            })
+            .await
         })
-        .await
     }
 
     #[tracing::instrument(

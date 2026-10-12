@@ -74,6 +74,20 @@ pub(crate) fn regctl_path(deps_path: &Path) -> PathBuf {
         .join("regctl")
 }
 
+/// Admission limits for API-triggered pause and resume operations.
+#[derive(Debug, Clone, Config)]
+pub struct ApiServerConfig {
+    /// Zero disables the pause concurrency limit.
+    #[config(default = 0usize)]
+    pub pause_max_inflight: usize,
+    /// Zero disables the resume concurrency limit.
+    #[config(default = 0usize)]
+    pub resume_max_inflight: usize,
+    /// Maximum wait for a permit, excluding operation execution time.
+    #[config(default = 60u64)]
+    pub queue_timeout_secs: u64,
+}
+
 #[derive(Debug, Clone, Config)]
 pub struct AppConfig {
     #[config(
@@ -96,6 +110,8 @@ pub struct AppConfig {
     pub deps_path: PathBuf,
     #[config(default = "kvm", env = "AENV_VIRTUALIZATION_MODE")]
     pub virtualization_mode: VirtualizationMode,
+    #[config(nested)]
+    pub api_server: ApiServerConfig,
     #[config(nested)]
     pub firecracker: FirecrackerConfig,
     #[config(nested)]
@@ -722,6 +738,7 @@ pub(crate) use impl_config_default;
 
 impl_config_default!(
     AppConfig,
+    ApiServerConfig,
     BackendConfig,
     PosixFsBackendConfig,
     FirecrackerConfig,
@@ -1032,6 +1049,7 @@ impl AppConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        self.validate_api_server()?;
         self.validate_pool_config()?;
         self.image.cache.gc.validate()?;
         NetworkConfig::validate(&self.network)?;
@@ -1047,6 +1065,27 @@ impl AppConfig {
         self.validate_disk_rate_limit()?;
         self.validate_volume_limits()?;
         self.validate_template_builder()?;
+        Ok(())
+    }
+
+    fn validate_api_server(&self) -> Result<()> {
+        for (name, limit) in [
+            ("pause_max_inflight", self.api_server.pause_max_inflight),
+            ("resume_max_inflight", self.api_server.resume_max_inflight),
+        ] {
+            if limit > tokio::sync::Semaphore::MAX_PERMITS {
+                bail!("api_server.{name} exceeds the maximum semaphore capacity");
+            }
+        }
+        if self.api_server.queue_timeout_secs == 0
+            || std::time::Instant::now()
+                .checked_add(std::time::Duration::from_secs(
+                    self.api_server.queue_timeout_secs,
+                ))
+                .is_none()
+        {
+            bail!("api_server.queue_timeout_secs must be a positive, representable duration");
+        }
         Ok(())
     }
 
@@ -1496,6 +1535,36 @@ impl SandboxProxyConfig {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn api_server_admission_config_defaults_and_validation() -> Result<()> {
+        let mut config = AppConfig::default();
+        assert_eq!(config.api_server.pause_max_inflight, 0);
+        assert_eq!(config.api_server.resume_max_inflight, 0);
+        assert_eq!(config.api_server.queue_timeout_secs, 60);
+        config.validate_api_server()?;
+        config.api_server.pause_max_inflight = 4;
+        config.api_server.resume_max_inflight = 8;
+        config.validate_api_server()?;
+        config.api_server.queue_timeout_secs = 0;
+        assert!(config.validate_api_server().is_err());
+        config.api_server.queue_timeout_secs = 60;
+        config.api_server.pause_max_inflight = usize::MAX;
+        assert!(config.validate_api_server().is_err());
+        config.api_server.pause_max_inflight = 4;
+        config.api_server.resume_max_inflight = usize::MAX;
+        assert!(config.validate_api_server().is_err());
+
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path,
+            "[api_server]\npause_max_inflight = 2\nresume_max_inflight = 3\nqueue_timeout_secs = 9\n")?;
+        let loaded = ConfigManager::new_from_path(&path)?;
+        assert_eq!(loaded.config().api_server.pause_max_inflight, 2);
+        assert_eq!(loaded.config().api_server.resume_max_inflight, 3);
+        assert_eq!(loaded.config().api_server.queue_timeout_secs, 9);
+        Ok(())
+    }
 
     #[test]
     fn bundled_default_config_loads() -> Result<()> {
