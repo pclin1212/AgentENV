@@ -5826,7 +5826,7 @@ async fn admission_is_fifo_and_cancelled_waiters_do_not_consume_permits() {
     let mut third = Box::pin(limiter.acquire());
     assert!(poll!(&mut third).is_pending());
     drop(second_permit);
-    assert!(third.await.unwrap().is_some());
+    assert!(third.await.unwrap()._permit.is_some());
 }
 
 #[tokio::test]
@@ -5841,9 +5841,9 @@ async fn admission_timeout_removes_waiter_and_disabled_limit_does_not_wait() {
         })
     ));
     drop(permit);
-    assert!(limiter.acquire().await.unwrap().is_some());
+    assert!(limiter.acquire().await.unwrap()._permit.is_some());
     let disabled = LifecycleLimiter::new(0, Duration::from_secs(60), SandboxOperation::Pause);
-    assert!(disabled.acquire().await.unwrap().is_none());
+    assert!(disabled.acquire().await.unwrap()._permit.is_none());
 }
 
 #[tokio::test]
@@ -5914,7 +5914,10 @@ async fn lifecycle_admission_timeout_does_not_change_sandbox_state() -> Result<(
 #[tokio::test]
 async fn lifecycle_admission_cancelled_waiters_never_start() -> Result<()> {
     use futures::poll;
-    let orchestrator = make_admission_test_orchestrator(Duration::from_secs(60));
+    let recorder = LifecycleMetricsRecorder::default();
+    let orchestrator = metrics::with_local_recorder(&recorder, || {
+        make_admission_test_orchestrator(Duration::from_secs(60))
+    });
     let created = orchestrator
         .create_sandbox(create_request(Some(60), &[]))
         .await?;
@@ -5945,7 +5948,9 @@ async fn lifecycle_admission_cancelled_waiters_never_start() -> Result<()> {
     let admitted = orchestrator
         .admit_resume_sandbox(created.id, NewTimeout::UseExisting)
         .await?;
+    recorder.assert_counts("resume", 0.0, 1.0);
     drop(admitted);
+    recorder.assert_counts("resume", 0.0, 0.0);
     assert_eq!(
         orchestrator.get_sandbox(&created.id).await?.unwrap().state,
         SandboxState::Paused
@@ -5954,13 +5959,23 @@ async fn lifecycle_admission_cancelled_waiters_never_start() -> Result<()> {
         .resume_sandbox(created.id, NewTimeout::UseExisting)
         .await?;
     orchestrator.delete_sandbox(created.id).await?;
+    assert!(orchestrator.pause_sandbox(created.id).await.is_err());
+    recorder.assert_counts("pause", 0.0, 0.0);
+    assert!(orchestrator
+        .resume_sandbox(created.id, NewTimeout::UseExisting)
+        .await
+        .is_err());
+    recorder.assert_counts("resume", 0.0, 0.0);
     Ok(())
 }
 
 #[tokio::test]
 async fn lifecycle_admission_active_pause_keeps_slot_after_caller_cancellation() -> Result<()> {
     use futures::poll;
-    let orchestrator = make_admission_test_orchestrator(Duration::from_secs(60));
+    let recorder = LifecycleMetricsRecorder::default();
+    let orchestrator = metrics::with_local_recorder(&recorder, || {
+        make_admission_test_orchestrator(Duration::from_secs(60))
+    });
     let first = orchestrator
         .create_sandbox(create_request(Some(60), &[]))
         .await?;
@@ -5983,9 +5998,11 @@ async fn lifecycle_admission_active_pause_keeps_slot_after_caller_cancellation()
     wait_for_state(&orchestrator, &first.id, SandboxState::Pausing).await?;
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
+    recorder.assert_counts("pause", 0.0, 1.0);
 
     let mut queued = Box::pin(orchestrator.pause_sandbox(second.id));
     assert!(poll!(&mut queued).is_pending());
+    recorder.assert_counts("pause", 1.0, 1.0);
     assert_eq!(
         orchestrator.get_sandbox(&second.id).await?.unwrap().state,
         SandboxState::Running
@@ -5994,6 +6011,7 @@ async fn lifecycle_admission_active_pause_keeps_slot_after_caller_cancellation()
     tokio::time::timeout(Duration::from_secs(5), queued)
         .await
         .unwrap()?;
+    recorder.assert_counts("pause", 0.0, 0.0);
     assert_eq!(
         orchestrator.get_sandbox(&first.id).await?.unwrap().state,
         SandboxState::Paused
@@ -6006,7 +6024,10 @@ async fn lifecycle_admission_active_pause_keeps_slot_after_caller_cancellation()
 #[tokio::test]
 async fn lifecycle_admission_active_resume_keeps_slot_after_caller_cancellation() -> Result<()> {
     use futures::poll;
-    let orchestrator = make_admission_test_orchestrator(Duration::from_secs(60));
+    let recorder = LifecycleMetricsRecorder::default();
+    let orchestrator = metrics::with_local_recorder(&recorder, || {
+        make_admission_test_orchestrator(Duration::from_secs(60))
+    });
     let first = orchestrator
         .create_sandbox(create_request(Some(60), &[]))
         .await?;
@@ -6028,9 +6049,11 @@ async fn lifecycle_admission_active_resume_keeps_slot_after_caller_cancellation(
     wait_for_state(&orchestrator, &first.id, SandboxState::Resuming).await?;
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
+    recorder.assert_counts("resume", 0.0, 1.0);
 
     let mut queued = Box::pin(orchestrator.resume_sandbox(second.id, NewTimeout::UseExisting));
     assert!(poll!(&mut queued).is_pending());
+    recorder.assert_counts("resume", 1.0, 1.0);
     assert_eq!(
         orchestrator.get_sandbox(&second.id).await?.unwrap().state,
         SandboxState::Paused
@@ -6039,6 +6062,7 @@ async fn lifecycle_admission_active_resume_keeps_slot_after_caller_cancellation(
     tokio::time::timeout(Duration::from_secs(5), queued)
         .await
         .unwrap()?;
+    recorder.assert_counts("resume", 0.0, 0.0);
     assert_eq!(
         orchestrator.get_sandbox(&first.id).await?.unwrap().state,
         SandboxState::Running
@@ -6046,4 +6070,112 @@ async fn lifecycle_admission_active_resume_keeps_slot_after_caller_cancellation(
     orchestrator.delete_sandbox(first.id).await?;
     orchestrator.delete_sandbox(second.id).await?;
     Ok(())
+}
+
+#[derive(Default)]
+struct LifecycleMetricsRecorder {
+    gauges: StdMutex<HashMap<metrics::Key, Arc<metrics::atomics::AtomicU64>>>,
+}
+
+impl metrics::Recorder for LifecycleMetricsRecorder {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn register_counter(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        metrics::Counter::noop()
+    }
+    fn register_histogram(
+        &self,
+        _: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::noop()
+    }
+    fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::from_arc(Arc::clone(
+            self.gauges.lock().unwrap().entry(key.clone()).or_default(),
+        ))
+    }
+}
+
+impl LifecycleMetricsRecorder {
+    fn assert_counts(&self, operation: &'static str, queue: f64, executing: f64) {
+        let gauges = self.gauges.lock().unwrap();
+        for (name, expected) in [
+            ("agentenv_lifecycle_queue", queue),
+            ("agentenv_lifecycle_executing", executing),
+        ] {
+            let key =
+                metrics::Key::from_parts(name, vec![metrics::Label::new("operation", operation)]);
+            let actual = f64::from_bits(gauges[&key].load(Ordering::Acquire));
+            assert_eq!(actual, expected, "{name}, operation={operation}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn lifecycle_metrics_track_queue_timeout_cancellation_and_disabled_limits() {
+    use futures::poll;
+    let recorder = LifecycleMetricsRecorder::default();
+    let (pause, resume) = metrics::with_local_recorder(&recorder, || {
+        (
+            LifecycleLimiter::new(1, Duration::from_millis(10), SandboxOperation::Pause),
+            LifecycleLimiter::new(0, Duration::from_secs(60), SandboxOperation::Resume),
+        )
+    });
+    recorder.assert_counts("pause", 0.0, 0.0);
+    recorder.assert_counts("resume", 0.0, 0.0);
+    let active = pause.acquire().await.unwrap();
+    recorder.assert_counts("pause", 0.0, 1.0);
+    let mut cancelled = Box::pin(pause.acquire());
+    assert!(poll!(&mut cancelled).is_pending());
+    recorder.assert_counts("pause", 1.0, 1.0);
+    drop(cancelled);
+    recorder.assert_counts("pause", 0.0, 1.0);
+
+    assert!(matches!(
+        pause.acquire().await,
+        Err(OrchestratorError::LifecycleQueueTimeout { .. })
+    ));
+    recorder.assert_counts("pause", 0.0, 1.0);
+    let mut next = Box::pin(pause.acquire());
+    assert!(poll!(&mut next).is_pending());
+    recorder.assert_counts("pause", 1.0, 1.0);
+    drop(active);
+    let active = next.await.unwrap();
+    recorder.assert_counts("pause", 0.0, 1.0);
+
+    // Disabling the limit still counts active requests, without a queue.
+    let first = resume.acquire().await.unwrap();
+    let second = resume.acquire().await.unwrap();
+    recorder.assert_counts("resume", 0.0, 2.0);
+    recorder.assert_counts("pause", 0.0, 1.0);
+    drop((first, second));
+    recorder.assert_counts("resume", 0.0, 0.0);
+
+    let mut closed = Box::pin(pause.acquire());
+    assert!(poll!(&mut closed).is_pending());
+    pause.semaphore.as_ref().unwrap().close();
+    assert!(matches!(closed.await, Err(OrchestratorError::ShuttingDown)));
+    recorder.assert_counts("pause", 0.0, 1.0);
+    drop(active);
+    recorder.assert_counts("pause", 0.0, 0.0);
 }

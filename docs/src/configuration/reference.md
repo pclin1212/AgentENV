@@ -46,6 +46,11 @@ Requests wait FIFO with no queue-size cap. Queue timeout returns HTTP 500 for
 lifecycle APIs or 504 for proxy auto-resume. Connect and proxy auto-resume share
 the resume limit; connect to a running sandbox does not consume a slot.
 
+Prometheus gauges `agentenv_lifecycle_queue` and `agentenv_lifecycle_executing`
+count waiting and admitted requests by `operation="pause|resume"`. Admitted requests
+remain counted until completion, even if the caller cancels. With limits disabled,
+queue stays zero and executing still counts active requests.
+
 ## `[firecracker]`
 
 Firecracker VM binary and boot configuration.

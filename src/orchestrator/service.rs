@@ -113,30 +113,81 @@ struct LifecycleLimiter {
     semaphore: Option<Arc<Semaphore>>,
     queue_timeout: Duration,
     operation: SandboxOperation,
+    queue: metrics::Gauge,
+    executing: metrics::Gauge,
+}
+
+struct LifecycleGaugeGuard(metrics::Gauge);
+
+impl LifecycleGaugeGuard {
+    fn new(gauge: metrics::Gauge) -> Self {
+        gauge.increment(1.0);
+        Self(gauge)
+    }
+}
+
+impl Drop for LifecycleGaugeGuard {
+    fn drop(&mut self) {
+        self.0.decrement(1.0);
+    }
+}
+
+struct LifecyclePermit {
+    // Decrement before releasing the semaphore slot to the next request.
+    _executing: LifecycleGaugeGuard,
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 impl LifecycleLimiter {
     fn new(max_inflight: usize, queue_timeout: Duration, operation: SandboxOperation) -> Self {
+        let label = format!("{operation:?}").to_ascii_lowercase();
+        let queue = metrics::gauge!("agentenv_lifecycle_queue", "operation" => label.clone());
+        let executing = metrics::gauge!("agentenv_lifecycle_executing", "operation" => label);
+        // Expose zero before the first request without resetting shared gauges.
+        queue.increment(0.0);
+        executing.increment(0.0);
         Self {
             semaphore: (max_inflight > 0).then(|| Arc::new(Semaphore::new(max_inflight))),
             queue_timeout,
             operation,
+            queue,
+            executing,
         }
     }
 
-    async fn acquire(&self) -> Result<Option<OwnedSemaphorePermit>> {
-        let Some(semaphore) = &self.semaphore else {
-            return Ok(None);
+    async fn acquire(&self) -> Result<LifecyclePermit> {
+        let permit = if let Some(semaphore) = &self.semaphore {
+            Some(match Arc::clone(semaphore).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(tokio::sync::TryAcquireError::Closed) => {
+                    return Err(OrchestratorError::ShuttingDown);
+                }
+                Err(tokio::sync::TryAcquireError::NoPermits) => {
+                    let _queued = LifecycleGaugeGuard::new(self.queue.clone());
+                    match tokio::time::timeout(
+                        self.queue_timeout,
+                        Arc::clone(semaphore).acquire_owned(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(permit)) => permit,
+                        Ok(Err(_)) => return Err(OrchestratorError::ShuttingDown),
+                        Err(_) => {
+                            return Err(OrchestratorError::LifecycleQueueTimeout {
+                                operation: self.operation,
+                                timeout_secs: self.queue_timeout.as_secs(),
+                            });
+                        }
+                    }
+                }
+            })
+        } else {
+            None
         };
-        match tokio::time::timeout(self.queue_timeout, Arc::clone(semaphore).acquire_owned()).await
-        {
-            Ok(Ok(permit)) => Ok(Some(permit)),
-            Ok(Err(_)) => Err(OrchestratorError::ShuttingDown),
-            Err(_) => Err(OrchestratorError::LifecycleQueueTimeout {
-                operation: self.operation,
-                timeout_secs: self.queue_timeout.as_secs(),
-            }),
-        }
+        Ok(LifecyclePermit {
+            _executing: LifecycleGaugeGuard::new(self.executing.clone()),
+            _permit: permit,
+        })
     }
 }
 
