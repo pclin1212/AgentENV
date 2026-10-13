@@ -5999,6 +5999,7 @@ async fn lifecycle_admission_active_pause_keeps_slot_after_caller_cancellation()
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
     recorder.assert_counts("pause", 0.0, 1.0);
+    assert!(recorder.durations("pause", "execution").is_empty());
 
     let mut queued = Box::pin(orchestrator.pause_sandbox(second.id));
     assert!(poll!(&mut queued).is_pending());
@@ -6012,6 +6013,7 @@ async fn lifecycle_admission_active_pause_keeps_slot_after_caller_cancellation()
         .await
         .unwrap()?;
     recorder.assert_counts("pause", 0.0, 0.0);
+    assert_eq!(recorder.durations("pause", "execution").len(), 2);
     assert_eq!(
         orchestrator.get_sandbox(&first.id).await?.unwrap().state,
         SandboxState::Paused
@@ -6050,6 +6052,7 @@ async fn lifecycle_admission_active_resume_keeps_slot_after_caller_cancellation(
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
     recorder.assert_counts("resume", 0.0, 1.0);
+    assert!(recorder.durations("resume", "execution").is_empty());
 
     let mut queued = Box::pin(orchestrator.resume_sandbox(second.id, NewTimeout::UseExisting));
     assert!(poll!(&mut queued).is_pending());
@@ -6063,6 +6066,7 @@ async fn lifecycle_admission_active_resume_keeps_slot_after_caller_cancellation(
         .await
         .unwrap()?;
     recorder.assert_counts("resume", 0.0, 0.0);
+    assert_eq!(recorder.durations("resume", "execution").len(), 2);
     assert_eq!(
         orchestrator.get_sandbox(&first.id).await?.unwrap().state,
         SandboxState::Running
@@ -6073,8 +6077,18 @@ async fn lifecycle_admission_active_resume_keeps_slot_after_caller_cancellation(
 }
 
 #[derive(Default)]
+struct LifecycleTestHistogram(StdMutex<Vec<f64>>);
+
+impl metrics::HistogramFn for LifecycleTestHistogram {
+    fn record(&self, value: f64) {
+        self.0.lock().unwrap().push(value);
+    }
+}
+
+#[derive(Default)]
 struct LifecycleMetricsRecorder {
     gauges: StdMutex<HashMap<metrics::Key, Arc<metrics::atomics::AtomicU64>>>,
+    histograms: StdMutex<HashMap<metrics::Key, Arc<LifecycleTestHistogram>>>,
 }
 
 impl metrics::Recorder for LifecycleMetricsRecorder {
@@ -6104,10 +6118,16 @@ impl metrics::Recorder for LifecycleMetricsRecorder {
     }
     fn register_histogram(
         &self,
-        _: &metrics::Key,
+        key: &metrics::Key,
         _: &metrics::Metadata<'_>,
     ) -> metrics::Histogram {
-        metrics::Histogram::noop()
+        metrics::Histogram::from_arc(Arc::clone(
+            self.histograms
+                .lock()
+                .unwrap()
+                .entry(key.clone())
+                .or_default(),
+        ))
     }
     fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
         metrics::Gauge::from_arc(Arc::clone(
@@ -6117,6 +6137,18 @@ impl metrics::Recorder for LifecycleMetricsRecorder {
 }
 
 impl LifecycleMetricsRecorder {
+    fn durations(&self, operation: &'static str, phase: &str) -> Vec<f64> {
+        let key = metrics::Key::from_parts(
+            format!("agentenv_lifecycle_{phase}_duration_seconds"),
+            vec![metrics::Label::new("operation", operation)],
+        );
+        self.histograms.lock().unwrap()[&key]
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+    }
+
     fn assert_counts(&self, operation: &'static str, queue: f64, executing: f64) {
         let gauges = self.gauges.lock().unwrap();
         for (name, expected) in [
@@ -6145,31 +6177,44 @@ async fn lifecycle_metrics_track_queue_timeout_cancellation_and_disabled_limits(
     recorder.assert_counts("resume", 0.0, 0.0);
     let active = pause.acquire().await.unwrap();
     recorder.assert_counts("pause", 0.0, 1.0);
+    assert_eq!(recorder.durations("pause", "queue"), vec![0.0]);
+    assert!(recorder.durations("pause", "execution").is_empty());
     let mut cancelled = Box::pin(pause.acquire());
     assert!(poll!(&mut cancelled).is_pending());
     recorder.assert_counts("pause", 1.0, 1.0);
     drop(cancelled);
     recorder.assert_counts("pause", 0.0, 1.0);
+    assert_eq!(recorder.durations("pause", "queue").len(), 2);
+    assert!(recorder.durations("pause", "execution").is_empty());
 
     assert!(matches!(
         pause.acquire().await,
         Err(OrchestratorError::LifecycleQueueTimeout { .. })
     ));
     recorder.assert_counts("pause", 0.0, 1.0);
+    let waits = recorder.durations("pause", "queue");
+    assert_eq!(waits.len(), 3);
+    assert!(waits[2] >= pause.queue_timeout.as_secs_f64());
+    assert!(recorder.durations("pause", "execution").is_empty());
     let mut next = Box::pin(pause.acquire());
     assert!(poll!(&mut next).is_pending());
     recorder.assert_counts("pause", 1.0, 1.0);
     drop(active);
     let active = next.await.unwrap();
     recorder.assert_counts("pause", 0.0, 1.0);
+    assert_eq!(recorder.durations("pause", "queue").len(), 4);
+    assert_eq!(recorder.durations("pause", "execution").len(), 1);
 
     // Disabling the limit still counts active requests, without a queue.
     let first = resume.acquire().await.unwrap();
     let second = resume.acquire().await.unwrap();
     recorder.assert_counts("resume", 0.0, 2.0);
     recorder.assert_counts("pause", 0.0, 1.0);
+    assert_eq!(recorder.durations("resume", "queue"), vec![0.0, 0.0]);
+    assert!(recorder.durations("resume", "execution").is_empty());
     drop((first, second));
     recorder.assert_counts("resume", 0.0, 0.0);
+    assert_eq!(recorder.durations("resume", "execution").len(), 2);
 
     let mut closed = Box::pin(pause.acquire());
     assert!(poll!(&mut closed).is_pending());
@@ -6178,4 +6223,10 @@ async fn lifecycle_metrics_track_queue_timeout_cancellation_and_disabled_limits(
     recorder.assert_counts("pause", 0.0, 1.0);
     drop(active);
     recorder.assert_counts("pause", 0.0, 0.0);
+    let waits = recorder.durations("pause", "queue");
+    assert_eq!(waits.len(), 5);
+    assert!(waits[1..].iter().all(|duration| *duration > 0.0));
+    let executions = recorder.durations("pause", "execution");
+    assert_eq!(executions.len(), 2);
+    assert!(executions.iter().all(|duration| *duration > 0.0));
 }

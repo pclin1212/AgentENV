@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
 use tokio::sync::{
@@ -115,26 +115,39 @@ struct LifecycleLimiter {
     operation: SandboxOperation,
     queue: metrics::Gauge,
     executing: metrics::Gauge,
+    queue_duration: metrics::Histogram,
+    execution_duration: metrics::Histogram,
 }
 
-struct LifecycleGaugeGuard(metrics::Gauge);
+struct LifecycleMetricsGuard {
+    gauge: metrics::Gauge,
+    duration: metrics::Histogram,
+    started_at: Instant,
+}
 
-impl LifecycleGaugeGuard {
-    fn new(gauge: metrics::Gauge) -> Self {
+impl LifecycleMetricsGuard {
+    fn new(gauge: metrics::Gauge, duration: metrics::Histogram) -> Self {
+        let started_at = Instant::now();
         gauge.increment(1.0);
-        Self(gauge)
+        Self {
+            gauge,
+            duration,
+            started_at,
+        }
     }
 }
 
-impl Drop for LifecycleGaugeGuard {
+impl Drop for LifecycleMetricsGuard {
     fn drop(&mut self) {
-        self.0.decrement(1.0);
+        self.duration
+            .record(self.started_at.elapsed().as_secs_f64());
+        self.gauge.decrement(1.0);
     }
 }
 
 struct LifecyclePermit {
     // Decrement before releasing the semaphore slot to the next request.
-    _executing: LifecycleGaugeGuard,
+    _executing: LifecycleMetricsGuard,
     _permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -142,7 +155,14 @@ impl LifecycleLimiter {
     fn new(max_inflight: usize, queue_timeout: Duration, operation: SandboxOperation) -> Self {
         let label = format!("{operation:?}").to_ascii_lowercase();
         let queue = metrics::gauge!("agentenv_lifecycle_queue", "operation" => label.clone());
-        let executing = metrics::gauge!("agentenv_lifecycle_executing", "operation" => label);
+        let executing =
+            metrics::gauge!("agentenv_lifecycle_executing", "operation" => label.clone());
+        let queue_duration = metrics::histogram!(
+            "agentenv_lifecycle_queue_duration_seconds", "operation" => label.clone()
+        );
+        let execution_duration = metrics::histogram!(
+            "agentenv_lifecycle_execution_duration_seconds", "operation" => label
+        );
         // Expose zero before the first request without resetting shared gauges.
         queue.increment(0.0);
         executing.increment(0.0);
@@ -152,18 +172,24 @@ impl LifecycleLimiter {
             operation,
             queue,
             executing,
+            queue_duration,
+            execution_duration,
         }
     }
 
     async fn acquire(&self) -> Result<LifecyclePermit> {
         let permit = if let Some(semaphore) = &self.semaphore {
             Some(match Arc::clone(semaphore).try_acquire_owned() {
-                Ok(permit) => permit,
+                Ok(permit) => {
+                    self.queue_duration.record(0.0);
+                    permit
+                }
                 Err(tokio::sync::TryAcquireError::Closed) => {
                     return Err(OrchestratorError::ShuttingDown);
                 }
                 Err(tokio::sync::TryAcquireError::NoPermits) => {
-                    let _queued = LifecycleGaugeGuard::new(self.queue.clone());
+                    let _queued =
+                        LifecycleMetricsGuard::new(self.queue.clone(), self.queue_duration.clone());
                     match tokio::time::timeout(
                         self.queue_timeout,
                         Arc::clone(semaphore).acquire_owned(),
@@ -182,10 +208,14 @@ impl LifecycleLimiter {
                 }
             })
         } else {
+            self.queue_duration.record(0.0);
             None
         };
         Ok(LifecyclePermit {
-            _executing: LifecycleGaugeGuard::new(self.executing.clone()),
+            _executing: LifecycleMetricsGuard::new(
+                self.executing.clone(),
+                self.execution_duration.clone(),
+            ),
             _permit: permit,
         })
     }

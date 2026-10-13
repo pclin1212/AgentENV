@@ -51,6 +51,12 @@ count waiting and admitted requests by `operation="pause|resume"`. Admitted requ
 remain counted until completion, even if the caller cancels. With limits disabled,
 queue stays zero and executing still counts active requests.
 
+Histograms `agentenv_lifecycle_queue_duration_seconds` and
+`agentenv_lifecycle_execution_duration_seconds` report seconds by the same operation
+label. Queue time includes timed-out/cancelled waits; immediate admission records zero.
+Execution time covers slot acquisition through completion, including errors and work
+continuing after caller cancellation. Existing stage metrics are unchanged.
+
 ## `[firecracker]`
 
 Firecracker VM binary and boot configuration.
